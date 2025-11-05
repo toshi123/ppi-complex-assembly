@@ -1,0 +1,36 @@
+name: ppi-complex-assembly
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  # Core
+  - python=3.11
+  - pip
+
+  # Scientific Python
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - scikit-learn
+
+  # Bio / structure
+  - gemmi
+  - biopython
+  - freesasa        # conda-forge にあるので便利
+  - networkx
+
+  # Jupyter
+  - jupyterlab
+  - ipykernel
+
+  # その他ツール（あれば）
+  - mmseqs2         # bioconda
+  # - blast         # 必要なら
+  # - hhsuite       # 必要なら
+
+  # pip でしか入らないものがあればここで
+  - pip:
+      # - some-package-from-pypi
+      # 例: prody を pip から入れる場合
+      # - prody
