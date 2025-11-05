@@ -1,0 +1,20 @@
+# データディレクトリなどのパス設定（環境依存情報はここに集約）
+# このファイルは Git にコミットしますが、個人の環境に合わせて編集してください
+
+# リポジトリのルートディレクトリ（相対パスはここからの相対）
+# 必要に応じて絶対パスで上書き可能
+data_dir: "data"
+raw_data_dir: "data/raw"
+interim_data_dir: "data/interim"
+processed_data_dir: "data/processed"
+
+results_dir: "results"
+figures_dir: "results/figures"
+tables_dir: "results/tables"
+logs_dir: "results/logs"
+
+# 外部ツールのパス（必要に応じて）
+# mmseqs_path: "/usr/local/bin/mmseqs"
+# blast_path: "/usr/local/bin/blastp"
+# gemmi_path: "/usr/local/bin/gemmi"
+

@@ -1,18 +1,71 @@
-# PPI Complex Assembly
+# PPI Complex Assembly プロジェクト共有メモ
 
-ヒトのタンパク質相互作用ネットワーク上で、
-既知複合体構造と相同性情報を利用して **巨大なタンパク質複合体を組み上げるプロジェクト** です。
+※ このドキュメントは、Cursor の AI へのコンテキスト共有用のまとめです。  
+リポジトリ構成、環境、スクリプトのたたき台をここに集約しています。
 
-- IntAct に登録された PPI をグラフとして扱い、
-- PDB に存在する複合体（および相同な複合体）をテンプレートとして、
-- 共通サブユニットの構造重ね合わせにより、より大きな複合体を構築します。
+---
 
-最終的には、構築した複合体のインターフェースに疾患関連変異（GWAS / ClinVar など）をマッピングし、
-**インターフェースのタイプと病原性との関係**を解析することを目標としています。
+## プロジェクト概要
 
-このアイデアは、以下の論文で行った解析を拡張・再構築したものです：
+- ヒト PPI（IntAct）をグラフとして扱い、PDB の複合体構造および相同性情報を用いて **大きなタンパク質複合体を組み上げる** プロジェクト。
 
-- Tsuji et al., *Scientific Reports* (2015) – multi-interface hub / singlish-interface hub 解析 など
+- 基本アイデア：
+  - IntAct の PPI をノード（タンパク質）・エッジ（相互作用）とするグラフにする
+  - PDB に存在する複合体（＋30%以上の相同性を持つ相同複合体）をテンプレートとして利用
+  - 共通サブユニット（例：タンパク質 A）で複合体を重ね合わせ、ABC…と拡張していく
+
+- 最終目標：
+  - 構築した複合体のインターフェースに GWAS / ClinVar などの疾患変異をマッピング
+  - **インターフェースのタイプ（多パートナー vs 単一パートナー）と病原性・物性との関係** を解析
+
+---
+
+## リポジトリの想定構成
+
+ルート例：`ppi-complex-assembly/`
+
+```text
+ppi-complex-assembly/
+├── README.md
+├── LICENSE
+├── environment.yml          # conda 環境定義
+├── .gitignore
+├── data/
+│   ├── README.md            # DBのダウンロード方法やバージョン管理
+│   ├── raw/                 # 生データ (IntAct, UniProt, PDBなど) → Git管理外
+│   ├── interim/             # 中間生成物 → Git管理外
+│   └── processed/           # 軽量な最終テーブルなど (必要に応じてGit管理)
+├── src/
+│   └── ppi_complex/
+│       ├── __init__.py
+│       ├── config.py        # 設定（必要に応じて）
+│       ├── download/        # IntAct, UniProt, PDB などのDL & 整形
+│       ├── homology/        # mmseqs2, BLAST などによる相同性検索
+│       ├── assembly/        # gemmi + TMalign/Mican による複合体組み上げ
+│       ├── interface/       # インターフェース抽出, ΔSASA, 物性解析
+│       ├── analysis/        # 変異・GWAS のマッピングと統計解析
+│       └── utils/           # ログ, パス解決など共通処理
+├── scripts/
+│   ├── download_intact.py
+│   ├── download_uniprot_human.py
+│   ├── download_pdb_seqres.py
+│   ├── build_pdb_chain_db.py
+│   ├── run_mmseqs_search.sh
+│   ├── map_intact_pairs_to_pdb.py
+│   └── build_complexes_from_graph.py
+├── notebooks/
+│   ├── 00_project_overview.ipynb
+│   ├── 10_mmseqs_qc.ipynb
+│   ├── 20_interface_properties.ipynb
+│   └── 30_variant_enrichment.ipynb
+├── results/
+│   ├── figures/             # 図 (png, pdf)
+│   ├── tables/              # 軽いTSV/CSV (最終結果等)
+│   └── logs/                # 実行ログなど
+└── config/
+    ├── paths.yaml           # データディレクトリなど（環境依存情報はここに）
+    └── project.yaml         # 閾値, 外部DBバージョンなど
+```
 
 ---
 
@@ -29,48 +82,8 @@
 
 ---
 
-## Repository Structure
+## このプロジェクトの背景
 
-このリポジトリは、だいたい次のような構成を想定しています（進行に応じて変える可能性あり）。
+このアイデアは、以下の論文で行った解析を拡張・再構築したものです：
 
-```text
-.
-├── README.md
-├── LICENSE
-├── pyproject.toml / requirements.txt / environment.yml
-├── .gitignore
-├── data/
-│   ├── README.md         # 外部DBのダウンロード方法・バージョン情報
-│   ├── raw/              # 生データ (IntAct, UniProt, PDBなど) → Git管理外
-│   ├── interim/          # 中間生成物 (mmseqs結果など) → Git管理外
-│   └── processed/        # 軽量な最終テーブルなど (必要に応じてGit管理)
-├── src/
-│   └── ppi_complex/
-│       ├── __init__.py
-│       ├── config.py
-│       ├── download/     # IntAct, UniProt, PDB などのDL & 整形
-│       ├── homology/     # mmseqs2, BLAST 等による相同性検索
-│       ├── assembly/     # gemmi + TMalign/Mican による複合体組み上げ
-│       ├── interface/    # インターフェース抽出, ΔSASA, 物性
-│       ├── analysis/     # 変異・GWAS のマッピングと統計解析
-│       └── utils/        # ログ, パス解決などの共通処理
-├── scripts/
-│   ├── download_intact.py
-│   ├── download_uniprot_human.py
-│   ├── download_pdb_seqres.py
-│   ├── build_pdb_chain_db.py
-│   ├── run_mmseqs_search.sh
-│   ├── map_intact_pairs_to_pdb.py
-│   └── build_complexes_from_graph.py
-├── notebooks/
-│   ├── 00_project_overview.ipynb
-│   ├── 10_mmseqs_qc.ipynb
-│   ├── 20_interface_properties.ipynb
-│   └── 30_variant_enrichment.ipynb
-├── results/
-│   ├── figures/          # 図 (png, pdfなど)
-│   ├── tables/           # 軽いTSV/CSV (論文用の最終テーブル)
-│   └── logs/             # 実行ログなど
-└── config/
-    ├── paths.yaml        # データディレクトリ等 (環境依存はここに集約)
-    └── project.yaml      # 閾値, バージョン情報など
+- Tsuji et al., *Scientific Reports* (2015) – multi-interface hub / singlish-interface hub 解析 など

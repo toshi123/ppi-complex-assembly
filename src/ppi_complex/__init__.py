@@ -13,6 +13,7 @@ __version__ = "0.1.0"
 
 # よく使うサブモジュールをここで import しておくと、
 # `import ppi_complex as pc` から `pc.homology.run_mmseqs(...)` みたいに触れる
+from . import config
 from . import download
 from . import homology
 from . import assembly
@@ -20,6 +21,7 @@ from . import interface
 from . import analysis
 
 __all__ = [
+    "config",
     "download",
     "homology",
     "assembly",
