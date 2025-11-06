@@ -1,0 +1,28 @@
+# プロジェクト全体の設定（閾値、外部DBバージョンなど）
+
+# 相同性検索の閾値
+homology:
+  identity_threshold: 0.30  # 30%以上の相同性を持つ複合体を利用
+  coverage_threshold: 0.80  # 80%以上のクエリカバレッジ
+
+# 複合体組み上げのパラメータ
+assembly:
+  max_extension_iterations: 10  # 最大拡張回数
+  rmsd_threshold: 2.0  # 重ね合わせのRMSD閾値（Å）
+
+# インターフェース解析のパラメータ
+interface:
+  contact_distance: 5.0  # コンタクト距離（Å）
+  min_interface_size: 10  # 最小インターフェース残基数
+
+# 外部データベースのバージョン情報（ダウンロード時に記録）
+databases:
+  intact_version: null  # ダウンロード時に記録
+  uniprot_version: null
+  pdb_version: null
+
+# その他の設定
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
