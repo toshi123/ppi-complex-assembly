@@ -15,7 +15,7 @@ import urllib.request
 
 # 典型的な URL（変わる可能性はあるので適宜更新）
 DEFAULT_PDB_SEQRES_URL = (
-    "https://ftp.wwpdb.org/pub/pdb/derived_data/pdb_seqres.txt"
+    "https://files.rcsb.org/pub/pdb/derived_data/pdb_seqres.txt"
 )
 
 
