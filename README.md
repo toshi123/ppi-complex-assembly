@@ -57,11 +57,15 @@ ppi-complex-assembly/
 │   ├── download_uniprot_human.py
 │   ├── download_pdb_seqres.py
 │   ├── download_sifts_mapping.py
+│   ├── download_clinvar.py
+│   ├── download_gwas_catalog.py
 │   ├── build_pdb_chain_db.py
 │   ├── build_human_db.py
 │   ├── filter_intact_human.py
-│   ├── run_mmseqs_search.sh          # UniProt vs PDBチェーンの検索（予定）
-│   ├── map_intact_pairs_to_pdb.py    # IntActペア→PDBテンプレート（予定）
+│   ├── run_mmseqs_search.sh          # UniProt vs PDBチェーン検索
+│   ├── convert_human_vs_pdb.sh       # mmseqs convertalis ラッパー
+│   ├── check_mapping_mmseqs_sifts_intact.py # IntAct/mmseqs/SIFTS の QC
+│   ├── map_intact_pairs_to_pdb.py    # IntActペア→PDBテンプレート一覧
 │   └── build_complexes_from_graph.py # 複合体組み上げ（予定）
 ├── notebooks/
 │   ├── 00_project_overview.ipynb
@@ -151,6 +155,12 @@ python scripts/download_pdb_seqres.py
 
 # SIFTS PDB–UniProt mapping
 python scripts/download_sifts_mapping.py
+
+# ClinVar VCF (GRCh38; optional, 変異解析用)
+python scripts/download_clinvar.py
+
+# GWAS Catalog associations (optional)
+python scripts/download_gwas_catalog.py
 ```
 
 ダウンロード後、`data/raw/` に例えば次のようなファイルができている想定です：
@@ -159,6 +169,8 @@ python scripts/download_sifts_mapping.py
 * `uniprot_human_all_20251110.fasta`
 * `pdb_seqres_20251111.txt`
 * `pdb_chain_uniprot_20251111.csv.gz`
+* `clinvar_grch38_YYYYMMDD.vcf.gz`（任意）
+* `gwas_catalog_associations_YYYYMMDD.tsv.gz`（任意）
 
 ### 2. 現行版ファイルへのシンボリックリンク（任意だが推奨）
 
@@ -232,48 +244,122 @@ python scripts/build_human_db.py
 
 が揃った状態になります。
 
-> 次のステップ（予定）
-> `scripts/run_mmseqs_search.sh` を用意し、
-> `mmseqs search human_db pdb_chain_db ...` による
-> UniProt→PDB チェーンの相同性テーブル (`human_vs_pdb.m8`) を生成する。
+### 6. UniProt ↔ PDB チェーンの相同性検索（mmseqs2）
+
+`run_mmseqs_search.sh` が `mmseqs search` を実行し、`human_db`（Query）と `pdb_chain_db`（Target）から `data/interim/mmseqs/human_vs_pdb` を生成します。
+
+```bash
+bash scripts/run_mmseqs_search.sh
+```
+
+スクリプトは `--min-seq-id 0.3` と `-e 1e-3` を既定値に固定しており、テンポラリディレクトリ `data/interim/mmseqs/tmp` を併用します。
+
+```1:7:scripts/run_mmseqs_search.sh
+mmseqs search \
+  data/interim/mmseqs/human_db \
+  data/interim/mmseqs/pdb_chain_db \
+  data/interim/mmseqs/human_vs_pdb \
+  data/interim/mmseqs/tmp \
+  --min-seq-id 0.3 \
+  -e 1e-3
+```
+
+再実行する場合は `human_vs_pdb*` を削除するか別プレフィックスを指定してください。
+
+### 7. `convertalis` による m8 生成 & マッピング QC（任意）
+
+`mmseqs search` の結果 DB から TSV (`human_vs_pdb.m8`) を作るには以下を実行します。
+
+```bash
+bash scripts/convert_human_vs_pdb.sh
+```
+
+内部では `mmseqs convertalis` を呼び出し、`query,target,pident,...,bits` までの 10 列を出力しています。
+
+```47:54:scripts/convert_human_vs_pdb.sh
+"${MMSEQS_BIN}" convertalis \
+  "${HUMAN_DB}" \
+  "${PDB_CHAIN_DB}" \
+  "${RESULT_DB}" \
+  "${RESULT_TSV}" \
+  --format-output "query,target,pident,alnlen,qstart,qend,tstart,tend,evalue,bits"
+```
+
+IntAct / mmseqs / SIFTS の ID が一貫しているか手早く確認したいときは `scripts/check_mapping_mmseqs_sifts_intact.py` を使います。
+
+```bash
+python scripts/check_mapping_mmseqs_sifts_intact.py
+```
+
+この QC スクリプトは mmseqs の target を SIFTS チェーン (`chain_label`) と突き合わせ、IntAct に出現する UniProt との共通部分をサマリ表示します。
+
+```270:298:scripts/check_mapping_mmseqs_sifts_intact.py
+m8_with_sifts = m8_df.merge(
+    sifts_chain_uniprot,
+    left_on="target",
+    right_on="chain_label",
+    how="left",
+    indicator=True,
+)
+...
+connected = m8_with_sifts[mask_query_in_intact & mask_has_sifts]
+print(f"[INFO] # hits with query∈IntAct & SIFTS UniProt : {n_connected_hits}")
+```
+
+### 8. IntAct ペアと PDB テンプレートの統合
+
+`map_intact_pairs_to_pdb.py` は IntAct ペア、`human_vs_pdb.m8`、SIFTS を突き合わせ、`data/interim/intact_pairs_with_pdb_templates.tsv` を生成します。相同性の閾値（例：`--min-pident 0.30`、`--min-alnlen 30`）や 1 UniProt あたりのヒット上限（`--max-hits-per-uniprot`）を CLI 引数で調整できます。
+
+```bash
+python scripts/map_intact_pairs_to_pdb.py \
+  --min-pident 0.30 \
+  --min-alnlen 30 \
+  --max-evalue 1e-5
+```
+
+スクリプト本体は IntAct ペア → SIFTS チェーン → PDB ID を順につなぎ、`uniprot_a/uniprot_b` ごとに同一 PDB に含まれる鎖ペアを列挙します。
+
+```573:614:scripts/map_intact_pairs_to_pdb.py
+pair_templates = build_intact_pair_templates(
+    intact_df=intact_df,
+    uniprot_chain_table=uniprot_chain_table,
+    allow_self_chain=args.allow_self_chain,
+)
+pair_templates.to_csv(output_path, sep="\t", index=False)
+print(f"[INFO] Written: {output_path}")
+```
+
+出力カラムは `pdb_id`, `chain_id_a/b`, `pident_a/b`, `evalue_a/b` などで構成され、後続の複合体組み上げステップのテンプレート一覧として利用します。
 
 ---
 
-## 今後のパイプライン（予定）
-
-ここから先はまだ実装途中ですが、目標としているフローは以下の通りです。
+## 今後のパイプライン（進捗メモ）
 
 1. **PPI グラフの構築**
 
-   * `data/interim/intact_human_pairs.tsv` から NetworkX などでグラフ構築。
+   * `data/interim/intact_human_pairs.tsv` の作成までは完了済み。NetworkX でのグラフ構築・解析ユーティリティを今後追加予定。
 
 2. **UniProt→PDB チェーン相同性検索（mmseqs2）**
 
-   * `run_mmseqs_search.sh` で `human_db` vs `pdb_chain_db` を検索。
-   * 結果を `human_vs_pdb.m8` として出力。
+   * `run_mmseqs_search.sh` と `convert_human_vs_pdb.sh` で `human_vs_pdb.m8` を自動生成できる状態。
+   * `check_mapping_mmseqs_sifts_intact.py` により ID マッピングの QC も可能。
 
 3. **PDB 複合体テンプレートリストの作成**
 
-   * `pdb_chain_uniprot_current.csv.gz`（SIFTS）と mmseqs 結果を組み合わせ、
-   * IntActペア (A,B) に対応する複合体テンプレート (PDBID, chainA, chainB, pident, coverage, ...) のテーブルを作る。
+   * `map_intact_pairs_to_pdb.py` が `intact_pairs_with_pdb_templates.tsv` を出力するところまで整備済み。
 
 4. **複合体組み上げ**
 
-   * テンプレート付きエッジだけからなるサブグラフを抽出。
-   * 共通サブユニットを介して gemmi + TMalign/Mican で複合体を拡張。
-   * ステリッククラッシュなどをチェックし、不合理なモデルを除外。
+   * gemmi + TMalign/Mican による構造拡張ロジックを `build_complexes_from_graph.py` 以下で実装予定。
 
 5. **インターフェース解析**
 
-   * FreeSASA + gemmi で ΔSASA を計算。
-   * 接触残基・インターフェースパッチの定義。
-   * 多パートナー界面 / 単一パートナー界面などに分類。
+   * FreeSASA + gemmi で ΔSASA や接触残基を定義するスクリプト／モジュールを追加予定。
 
 6. **疾患変異・物性解析**
 
-   * ClinVar / GWAS の変異をインターフェース残基にマッピング。
-   * 疾患変異のエンリッチメント解析。
-   * インターフェースの物性（疎水性、電荷、パッチサイズなど）との関係を解析。
+   * `download_clinvar.py` / `download_gwas_catalog.py` でデータ取得まで対応済み。  
+     変異マッピングと統計解析は `src/ppi_complex/interface` / `analysis` 以下に今後実装予定。
 
 ---
 
@@ -287,6 +373,8 @@ python scripts/build_human_db.py
   * [x] UniProt human (`download_uniprot_human.py`)
   * [x] PDB SEQRES (`download_pdb_seqres.py`)
   * [x] SIFTS PDB–UniProt mapping (`download_sifts_mapping.py`)
+  * [x] ClinVar VCF (`download_clinvar.py`)
+  * [x] GWAS Catalog associations (`download_gwas_catalog.py`)
 * [x] IntAct ヒト PPI ペア抽出
 
   * [x] `filter_intact_human.py` による human–human UniProt ペア作成
@@ -296,10 +384,13 @@ python scripts/build_human_db.py
 * [x] UniProt(Human) mmseqs2 DB
 
   * [x] `build_human_db.py`
-* [ ] UniProt ↔ PDB チェーン相同性検索（mmseqs2）
+* [x] UniProt ↔ PDB チェーン相同性検索（mmseqs2）
 
-  * [ ] `run_mmseqs_search.sh` による `human_vs_pdb.m8` の生成
-* [ ] PDB 複合体テンプレートリストの作成
+  * [x] `run_mmseqs_search.sh` ＋ `convert_human_vs_pdb.sh`
+  * [x] `check_mapping_mmseqs_sifts_intact.py` による QC
+* [x] PDB 複合体テンプレートリストの作成
+
+  * [x] `map_intact_pairs_to_pdb.py`
 * [ ] 複合体組み上げコード（gemmi + TMalign/Mican）
 * [ ] インターフェース抽出 & ΔSASA 計算
 * [ ] 疾患変異のマッピングと解析
