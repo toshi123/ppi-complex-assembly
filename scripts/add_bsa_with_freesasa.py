@@ -1,17 +1,19 @@
 #!/usr/bin/env python
 # scripts/add_bsa_with_freesasa.py
 """
-TopK/tight などの TSV に BSA(= SASA(A)+SASA(B)-SASA(AB)) と
-ΔSASA 由来の界面残基集合を付与する決定版。
+TSV に BSA(= SASA(A)+SASA(B)-SASA(AB)) と ΔSASA 由来の界面残基集合を付与する決定版。
 
-改良点:
-  - タスクを (pdb_id, chain_id_a, chain_id_b) でユニーク化 → 計算重複を排除
-  - マージは m:1 を厳格検証 (validate="m:1") → 行数爆増を根本防止
-  - ポリマー残基のみを書き出し (水/リガンド/HETATMを除外) → BSAの物理整合性向上
-  - AB の原子数 ≤ A の原子数 + B の原子数 を強制チェック
-  - 小さな負の BSA は丸め誤差として 0.0 にクランプ、大きな負は無効化
-  - 並列 (imap_unordered) + 進捗ログ (--progress-every)
-  - FreeSASA の stderr を/dev/null へ送る (--suppress-stderr; 既定ON)
+◎ 主なポイント
+- (pdb_id, chain_id_a, chain_id_b) でユニーク化してタスク生成 → 重複計算防止
+- 右表は m:1 検証で安全マージ → 行数爆増を根本防止
+- ポリマー残基のみ（HETATM/水を除外）で A/B/AB を統一抽出
+- AB の原子数 ≤ A の原子数 + B の原子数 を強制チェック
+- 微小負 BSA は 0 にクランプ、大きな負は無効化
+- FreeSASA の stderr 抑制（既定 ON）
+- 進捗ログ（--progress-every）
+- ★ BSA 帯域フィルタ内蔵（既定 800–3200 Å²）：
+    - 既定では帯域外の値は NaN にし、列 bsa_in_band=False を付与（行数は維持）
+    - --keep-out-of-band で帯域外も値を保持可能
 
 依存: gemmi, freesasa, pandas
 """
@@ -43,9 +45,16 @@ def parse_args():
                     help="FreeSASA等のstderrを/dev/nullへ (既定ON)")
     ap.add_argument("--no-suppress-stderr", dest="suppress_stderr",
                     action="store_false", help="stderrを抑制しない")
+    # ★ BSA 帯域
+    ap.add_argument("--bsa-min", type=float, default=800.0, help="BSA 下限（total Å²）")
+    ap.add_argument("--bsa-max", type=float, default=3200.0, help="BSA 上限（total Å²）")
+    ap.add_argument("--keep-out-of-band", action="store_true",
+                    help="帯域外でも BSA/ΔSASA を保持（既定は NaN にして除外相当）")
     return ap.parse_args()
 
 # ---------- stderr suppress (C拡張対応) ----------
+from contextlib import contextmanager
+
 @contextmanager
 def suppress_stderr_fd(active: bool = True):
     if not active:
@@ -101,8 +110,7 @@ def _write_polymer_chains_to_pdb(model: gemmi.Model, chains: set, out_pdb: Path)
         if ch in names:
             new_c = gemmi.Chain(ch)
             for res in model[ch]:
-                # タンパク/核酸などのポリマー残基のみ
-                if res.is_polymer():
+                if res.is_polymer():  # タンパク/核酸など
                     new_c.add_residue(res)
             if len(new_c):
                 m.add_chain(new_c)
@@ -146,10 +154,12 @@ def _atom_count(pdb_path: Path) -> int:
 # -------------- Worker --------------
 def _job(task):
     """
-    task: (pdb_id, chain_id_a, chain_id_b, pdb_dir:str, use_assembly:bool, suppress_stderr:bool)
+    task: (pdb_id, chain_id_a, chain_id_b, pdb_dir:str, use_assembly:bool, suppress_stderr:bool,
+           bsa_min:float, bsa_max:float, keep_out_of_band:bool)
     戻り dict はキー (pdb_id, chain_id_a, chain_id_b) で一意。
     """
-    pdb_id, ca, cb, pdb_dir_s, use_assembly, suppress = task
+    (pdb_id, ca, cb, pdb_dir_s, use_assembly, suppress,
+     bsa_min, bsa_max, keep_oob) = task
     pdb_dir = Path(pdb_dir_s)
     gz = _find_structure_path(pdb_id, pdb_dir)
     if gz is None:
@@ -195,7 +205,6 @@ def _job(task):
         if bsa < 0 and abs(bsa) < 1e-3:
             bsa = 0.0
         elif bsa < 0:
-            # 明らかに不正
             for p in (complex_pdb, a_pdb, b_pdb):
                 try: p.unlink()
                 except Exception: pass
@@ -208,6 +217,21 @@ def _job(task):
         iface_a = _resid_set_from_delta(sa_a, sab)
         iface_b = _resid_set_from_delta(sa_b, sab)
 
+        # ★ BSA 帯域フィルタ（既定 800–3200）
+        in_band = (bsa_min <= bsa <= bsa_max)
+        if not in_band and not keep_oob:
+            # 帯域外は値を落として NaN に（行数は維持）
+            return {
+                "pdb_id": pdb_id, "chain_id_a": ca, "chain_id_b": cb,
+                "sasa_a": None, "sasa_b": None, "sasa_ab": None,
+                "bsa_total": None,
+                "iface_sasa_a": "",
+                "iface_sasa_b": "",
+                "n_iface_sasa_a": 0,
+                "n_iface_sasa_b": 0,
+                "bsa_in_band": False,
+            }
+
         return {
             "pdb_id": pdb_id, "chain_id_a": ca, "chain_id_b": cb,
             "sasa_a": sasa_a, "sasa_b": sasa_b, "sasa_ab": sasa_ab,
@@ -216,24 +240,18 @@ def _job(task):
             "iface_sasa_b": ",".join(sorted(iface_b)),
             "n_iface_sasa_a": len(iface_a),
             "n_iface_sasa_b": len(iface_b),
+            "bsa_in_band": in_band,
         }
 
     except Exception:
         return None
     finally:
         # 中間PDBは掃除（必要ならコメントアウト）
-        for p in ("AB", "A", "B"):
-            try:
-                Path(f".tmp_bsa/{pdb_id}_{ca}{cb}_{p}.pdb").unlink()
-            except Exception:
-                pass
-        # 旧名（安全清掃）
         for p in (f".tmp_bsa/{pdb_id}_{ca}{cb}_AB.pdb",
                   f".tmp_bsa/{pdb_id}_{ca}_A.pdb",
                   f".tmp_bsa/{pdb_id}_{cb}_B.pdb"):
             try: Path(p).unlink()
-            except Exception:
-                pass
+            except Exception: pass
 
 # -------------- Main --------------
 def main():
@@ -252,10 +270,12 @@ def main():
     uniq = (df[key_cols].drop_duplicates()
             .astype({"pdb_id": str, "chain_id_a": str, "chain_id_b": str}))
     tasks = [(r.pdb_id, r.chain_id_a, r.chain_id_b,
-              str(pdb_dir), bool(args.assembly), bool(args.suppress_stderr))
+              str(pdb_dir), bool(args.assembly), bool(args.suppress_stderr),
+              float(args.bsa_min), float(args.bsa_max), bool(args.keep_out_of_band))
              for r in uniq.itertuples(index=False)]
     total = len(tasks)
     print(f"[INFO] tasks (unique keys): {total}  n_proc={args.n_proc}  assembly={args.assembly}  suppress_stderr={args.suppress_stderr}")
+    print(f"[INFO] BSA band: [{args.bsa_min}, {args.bsa_max}] keep_out_of_band={args.keep_out_of_band}")
 
     # ---- 並列実行（逐次進捗） ----
     results = []
@@ -294,6 +314,11 @@ def main():
     print("[INFO] done")
     print(f"[INFO] input rows={len(df)}  output rows={len(out_df)}")
     print(f"[INFO] unique keys={total}  ok={ok}  fail={fail}")
+    if "bsa_in_band" in out_df.columns:
+        n_true  = out_df["bsa_in_band"].sum(skipna=True)
+        n_false = (out_df["bsa_in_band"]==False).sum()
+        n_na    = out_df["bsa_in_band"].isna().sum()
+        print(f"[INFO] bsa_in_band: True={n_true}  False={n_false}  NA={n_na}")
     print(f"[INFO] written: {args.output}")
 
 if __name__ == "__main__":
