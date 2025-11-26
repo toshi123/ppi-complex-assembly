@@ -1,172 +1,236 @@
 #!/usr/bin/env python
 # scripts/add_bsa_with_freesasa.py
+
 """
-TopK多様性ファイル（または tight/contacts ファイル）に
-BSA (Buried Surface Area) と ΔSASA 由来の界面残基集合を付与する。
+TopK/tightファイルに BSA (Buried Surface Area) と ΔSASA 由来の界面残基集合を付与する。
+改良点:
+  - 進捗ログ: --progress-every（既定100）
+  - FreeSASAのstderr抑制: --suppress-stderr（既定ON）
+  - 並列: imap_unorderedで逐次集計、失敗はスキップして続行
 
-入力: TSV（必須列）
-  - pdb_id, chain_id_a, chain_id_b
-  - （任意）iface_res_a/b があってもOK（上書きはしない）
-
-出力: 入力列 + 追加列
-  - bsa_total                # Å^2
-  - sasa_a, sasa_b, sasa_ab  # 参考
-  - iface_sasa_a, iface_sasa_b  # ΔSASA>0 の残基ID（カンマ区切り）
-  - n_iface_sasa_a, n_iface_sasa_b
-
-使い方:
-  python scripts/add_bsa_with_freesasa.py \
-    --input  data/interim/intact_pairs_with_pdb_contacts_topk_diverse.tsv \
-    --output data/interim/intact_pairs_with_pdb_contacts_topk_diverse_bsa.tsv \
-    --pdb-dir data/raw/pdb_structures --n-proc 6
+依存: gemmi, freesasa, pandas
 """
 
-import argparse, math, sys, gzip
+import argparse, sys, os, math, gzip
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
+from contextlib import contextmanager
 import pandas as pd
 import gemmi, freesasa
 
+# ---------------- CLI ----------------
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", required=True)
     ap.add_argument("--output", required=True)
     ap.add_argument("--pdb-dir", default="data/raw/pdb_structures")
     ap.add_argument("--n-proc", type=int, default=max(1, cpu_count()-1))
-    ap.add_argument("--assembly", action="store_true", help="生物学的会合体（最初のassembly）で評価")
+    ap.add_argument("--assembly", action="store_true",
+                    help="生物学的会合体（最初のassembly）で評価")
+    ap.add_argument("--progress-every", type=int, default=100,
+                    help="この件数ごとに進捗を表示")
+    ap.add_argument("--suppress-stderr", dest="suppress_stderr", action="store_true", default=True,
+                    help="FreeSASAなどのstderrを/dev/nullへ（既定ON）")
+    ap.add_argument("--no-suppress-stderr", dest="suppress_stderr", action="store_false",
+                    help="stderrを抑制しない")
     return ap.parse_args()
 
+# ---------- stderr suppress (C拡張対応) ----------
+@contextmanager
+def suppress_stderr_fd(active: bool = True):
+    if not active:
+        yield
+        return
+    try:
+        stderr_fd = sys.stderr.fileno()
+    except Exception:
+        # 環境によってはfilenoが無い
+        yield
+        return
+    with open(os.devnull, "w") as devnull:
+        old_stderr_fd = os.dup(stderr_fd)
+        try:
+            os.dup2(devnull.fileno(), stderr_fd)
+            yield
+        finally:
+            try:
+                os.dup2(old_stderr_fd, stderr_fd)
+            finally:
+                os.close(old_stderr_fd)
+
+# -------------- IO helpers --------------
 def _read_structure_gz(path: Path) -> gemmi.Structure:
     return gemmi.read_structure(str(path))
 
 def _write_chains_to_pdb(model: gemmi.Model, chains:set, out_pdb: Path):
-    st = gemmi.Structure()
-    st.name = "sel"
+    st = gemmi.Structure(); st.name = "sel"
     m = gemmi.Model("1")
-    for ch in model:
-        if ch.name in chains:
-            m.add_chain(ch)
+    names = {c.name for c in model}
+    for ch in list(chains):
+        if ch in names:
+            m.add_chain(model[ch])
     st.add_model(m)
     st.write_minimal_pdb(str(out_pdb))
 
-def _sasa_total(pdb_path: Path) -> float:
-    s = freesasa.Structure(str(pdb_path))
-    r = freesasa.calc(s)
+def _find_structure_path(pdb_id: str, pdb_dir: Path) -> Path | None:
+    for ext in (".bcif.gz",".cif.gz",".cif",".bcif"):
+        p = pdb_dir / f"{pdb_id}{ext}"
+        if p.exists(): return p
+    return None
+
+# -------------- FreeSASA --------------
+def _sasa_total(pdb_path: Path, suppress: bool) -> float:
+    with suppress_stderr_fd(suppress):
+        s = freesasa.Structure(str(pdb_path))
+        r = freesasa.calc(s)
     return float(r.totalArea())
 
-def _residue_deltasasa(pdb_path: Path, tag:str):
+def _residue_sasa(pdb_path: Path, suppress: bool):
     """
-    RSAフォーマットを一度出さず、freesasa.Result から per-atom を足し上げても良いが、
-    簡便のため Structure を再利用して residue 単位で集計。
-    ここでは“原始的に”PDBのresSeq+icodeをIDとして返す。
+    residue単位のSASA辞書を返す: { "123" : area, ... } （resSeq+icode）
     """
-    s = freesasa.Structure(str(pdb_path))
-    r = freesasa.calc(s)
+    with suppress_stderr_fd(suppress):
+        s = freesasa.Structure(str(pdb_path))
+        r = freesasa.calc(s)
     res_sasa = {}
     for i in range(s.nAtoms()):
-        atom = s.atomName(i).strip()
-        res  = s.residueNumber(i)  # 例: "123" or "123A"
+        res  = s.residueNumber(i)  # e.g. "123" or "123A"
         res_sasa[res] = res_sasa.get(res, 0.0) + r.atomArea(i)
-    return res_sasa  # dict: { "123" : area, ... }
+    return res_sasa
 
 def _resid_set_from_delta(before:dict, after:dict):
-    # ΔSASA = SASA(単独) - SASA(複合体) > 0
-    ids = set(before.keys()) | set(after.keys())
+    ids = set(before) | set(after)
     iface = set()
     for k in ids:
         if before.get(k,0.0) - after.get(k,0.0) > 1e-6:
             iface.add(k)
     return iface
 
-def _job(row, pdb_dir:Path, use_assembly:bool):
-    pdb_id = str(row.pdb_id).lower()
-    ca = str(row.chain_id_a); cb = str(row.chain_id_b)
-    # 構造ファイルの候補
-    gz = None
-    for ext in (".bcif.gz",".cif.gz",".cif",".bcif"):
-        p = pdb_dir / f"{pdb_id}{ext}"
-        if p.exists():
-            gz = p; break
+# -------------- Worker --------------
+def _job(task):
+    """
+    task: (row_dict, pdb_dir:str, use_assembly:bool, suppress_stderr:bool)
+    """
+    row, pdb_dir_s, use_assembly, suppress = task
+    pdb_dir = Path(pdb_dir_s)
+
+    pdb_id = str(row["pdb_id"]).lower()
+    ca = str(row["chain_id_a"]); cb = str(row["chain_id_b"])
+
+    gz = _find_structure_path(pdb_id, pdb_dir)
     if gz is None:
         return None
 
-    st = _read_structure_gz(gz)
-    st.remove_waters()
-    model = None
-    if use_assembly and len(st.assemblies)>0:
-        try:
-            st_asm = st.make_assembly(st.assemblies[0].id)
-            model = st_asm[0]
-        except Exception:
+    try:
+        st = _read_structure_gz(gz)
+        st.remove_waters()
+        model = None
+        if use_assembly and len(st.assemblies)>0:
+            try:
+                st_asm = st.make_assembly(st.assemblies[0].id)
+                model = st_asm[0]
+            except Exception:
+                model = st[0]
+        else:
             model = st[0]
-    else:
-        model = st[0]
 
-    names = {c.name for c in model}
-    if ca not in names or cb not in names:
+        names = {c.name for c in model}
+        if ca not in names or cb not in names:
+            return None
+
+        outdir = Path(".tmp_bsa"); outdir.mkdir(exist_ok=True)
+        complex_pdb = outdir / f"{pdb_id}_{ca}{cb}_AB.pdb"
+        a_pdb       = outdir / f"{pdb_id}_{ca}_A.pdb"
+        b_pdb       = outdir / f"{pdb_id}_{cb}_B.pdb"
+        _write_chains_to_pdb(model, {ca,cb}, complex_pdb)
+        _write_chains_to_pdb(model, {ca}, a_pdb)
+        _write_chains_to_pdb(model, {cb}, b_pdb)
+
+        try:
+            sasa_a  = _sasa_total(a_pdb, suppress)
+            sasa_b  = _sasa_total(b_pdb, suppress)
+            sasa_ab = _sasa_total(complex_pdb, suppress)
+            bsa     = sasa_a + sasa_b - sasa_ab
+
+            sa_a = _residue_sasa(a_pdb, suppress)
+            sa_b = _residue_sasa(b_pdb, suppress)
+            sab  = _residue_sasa(complex_pdb, suppress)
+
+            iface_a = _resid_set_from_delta(sa_a, sab)
+            iface_b = _resid_set_from_delta(sa_b, sab)
+
+            return {
+                "pdb_id": pdb_id, "chain_id_a": ca, "chain_id_b": cb,
+                "sasa_a": sasa_a, "sasa_b": sasa_b, "sasa_ab": sasa_ab,
+                "bsa_total": bsa,
+                "iface_sasa_a": ",".join(sorted(iface_a)),
+                "iface_sasa_b": ",".join(sorted(iface_b)),
+                "n_iface_sasa_a": len(iface_a),
+                "n_iface_sasa_b": len(iface_b),
+            }
+        finally:
+            # 中間PDBは掃除（必要ならコメントアウト）
+            for p in (complex_pdb, a_pdb, b_pdb):
+                try: p.unlink()
+                except Exception: pass
+
+    except Exception:
+        # 失敗はNoneで返す（stderrは既に抑制済み）
         return None
 
-    # 一時PDBを書き出してFreeSASAで測る
-    outdir = Path(".tmp_bsa"); outdir.mkdir(exist_ok=True)
-    complex_pdb = outdir / f"{pdb_id}_{ca}{cb}_AB.pdb"
-    a_pdb       = outdir / f"{pdb_id}_{ca}_A.pdb"
-    b_pdb       = outdir / f"{pdb_id}_{cb}_B.pdb"
-
-    _write_chains_to_pdb(model, {ca,cb}, complex_pdb)
-    _write_chains_to_pdb(model, {ca}, a_pdb)
-    _write_chains_to_pdb(model, {cb}, b_pdb)
-
-    try:
-        sasa_a  = _sasa_total(a_pdb)
-        sasa_b  = _sasa_total(b_pdb)
-        sasa_ab = _sasa_total(complex_pdb)
-        bsa     = sasa_a + sasa_b - sasa_ab
-
-        # ΔSASAで界面残基集合を作る
-        sa_a = _residue_deltasasa(a_pdb, "A")
-        sa_b = _residue_deltasasa(b_pdb, "B")
-        sab  = _residue_deltasasa(complex_pdb, "AB")
-
-        iface_a = _resid_set_from_delta(sa_a, sab)
-        iface_b = _resid_set_from_delta(sa_b, sab)
-
-        return {
-            "pdb_id": pdb_id, "chain_id_a": ca, "chain_id_b": cb,
-            "sasa_a": sasa_a, "sasa_b": sasa_b, "sasa_ab": sasa_ab,
-            "bsa_total": bsa,
-            "iface_sasa_a": ",".join(sorted(list(iface_a))),
-            "iface_sasa_b": ",".join(sorted(list(iface_b))),
-            "n_iface_sasa_a": len(iface_a),
-            "n_iface_sasa_b": len(iface_b),
-        }
-    finally:
-        # 好みで中間PDBを残したいならコメントアウト
-        try:
-            complex_pdb.unlink(); a_pdb.unlink(); b_pdb.unlink()
-        except Exception:
-            pass
-
+# -------------- Main --------------
 def main():
     args = parse_args()
     pdb_dir = Path(args.pdb_dir)
+
     df = pd.read_csv(args.input, sep="\t")
     need = {"pdb_id","chain_id_a","chain_id_b"}
     miss = need - set(df.columns)
     if miss:
         print(f"[ERROR] missing columns: {miss}", file=sys.stderr); sys.exit(1)
 
-    tasks = [(row, pdb_dir, args.assembly) for _, row in df.iterrows()]
-    if args.n_proc==1:
-        results = [_job(r, pdb_dir, args.assembly) for r in df.itertuples(index=False)]
-    else:
-        with Pool(processes=args.n_proc) as pool:
-            results = pool.starmap(_job, tasks, chunksize=32)
+    # タスク化
+    tasks = []
+    for row in df.itertuples(index=False):
+        tasks.append((
+            row._asdict(),
+            str(pdb_dir),
+            bool(args.assembly),
+            bool(args.suppress_stderr),
+        ))
+    total = len(tasks)
+    print(f"[INFO] tasks: {total}  n_proc={args.n_proc}  assembly={args.assembly}  suppress_stderr={args.suppress_stderr}")
 
-    res_df = pd.DataFrame([r for r in results if r is not None])
-    out = df.merge(res_df, on=["pdb_id","chain_id_a","chain_id_b"], how="left")
-    out.to_csv(args.output, sep="\t", index=False)
-    print(f"[INFO] written: {args.output} rows={len(out)}",
-          f" with_bsa={res_df.shape[0]}", sep="\n")
+    results = []
+    processed = ok = fail = 0
+
+    if args.n_proc == 1:
+        it = map(_job, tasks)
+    else:
+        pool = Pool(processes=args.n_proc)
+        it = pool.imap_unordered(_job, tasks, chunksize=32)
+
+    try:
+        for res in it:
+            processed += 1
+            if res is None:
+                fail += 1
+            else:
+                ok += 1
+                results.append(res)
+            if processed % max(1, args.progress_every) == 0:
+                print(f"[INFO] progress: {processed}/{total}  ok={ok}  fail={fail}")
+    finally:
+        if args.n_proc != 1:
+            pool.close(); pool.join()
+
+    res_df = pd.DataFrame(results)
+    out_df = df.merge(res_df, on=["pdb_id","chain_id_a","chain_id_b"], how="left")
+    out_df.to_csv(args.output, sep="\t", index=False)
+
+    print("[INFO] done")
+    print(f"[INFO] processed={processed} ok={ok} fail={fail}")
+    print(f"[INFO] written: {args.output} rows={len(out_df)} with_bsa={res_df.shape[0]}")
 
 if __name__ == "__main__":
     main()
