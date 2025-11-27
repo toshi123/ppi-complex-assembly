@@ -1,164 +1,311 @@
 #!/usr/bin/env python
 # scripts/select_template_topk_diverse.py
 """
-多様性考慮 Top-K 代表テンプレート選出
-
-入力: filter_pdb_contacts_parallel.py の出力TSV
- 必須列:
-   - uniprot_a, uniprot_b, pdb_id, chain_id_a, chain_id_b
-   - min_atom_distance, n_atom_contacts
-   - iface_res_a, iface_res_b   # カンマ区切りの残基ID
-
-任意列（あれば使う）:
-   - has_ligand (bool), ligand_class (str)
-   - resol, pident_mean, assembly_id など
+各 IntAct ペア (uniprot_a, uniprot_b) について、テンプレート候補行から
+MMR(Maximal Marginal Relevance)で Top-K を選抜する。
 
 特徴:
- - base_score = (-min_atom_distance) + log1p(n_atom_contacts) (+任意の副次スコア)
- - MMR（Maximal Marginal Relevance）で多様性を確保
-   類似度: インターフェース残基Jaccard + (任意) リガンド状態一致, 同一PDB/assembly
+- 界面集合は --use-sasa-iface で ΔSASA 由来 (iface_sasa_*) を優先
+  (欠損時は距離由来 iface_res_* へフォールバック)
+- ベーススコア = w_dist*DistScore + w_contacts*ContactScore + w_bsa*BsaScore
+- 多様性: Jaccard類似度を用い MMR で選抜（同一PDB/Assembly/鎖組の小ペナ追加）
+- 出力にスコア内訳と選抜順位を付与
 
-使い方:
+必須列:
+  uniprot_a, uniprot_b, pdb_id, chain_id_a, chain_id_b
+推奨列:
+  min_atom_distance, n_atom_contacts
+  bsa_total (w_bsa>0なら)
+  iface_sasa_a, iface_sasa_b  または  iface_res_a, iface_res_b
+任意列:
+  assembly_id（あれば多様性ペナルティに使用）
+  has_ligand（0/1, True/False; w_lig で軽い多様性制御に使用可）
+
+使い方(例):
   python scripts/select_template_topk_diverse.py \
-    --input  data/interim/intact_pairs_with_pdb_contacts.tsv \
+    --input  data/interim/intact_pairs_with_pdb_contacts.tight_bsa.band.tsv \
     --output data/interim/intact_pairs_with_pdb_contacts_topk_diverse.tsv \
-    --k 3 --lambda 0.5 --min-iface-diff 0.25
+    --k 3 --lambda 0.5 --min-iface-diff 0.25 \
+    --use-sasa-iface \
+    --w-dist 1.0 --w-contacts 1.0 --w-bsa 0.5 \
+    --w-iface 1.0 --w-lig 0.3 --w-same-pdb 0.2 --w-same-asm 0.2
 """
 
 import argparse
 import math
-import pandas as pd
+from pathlib import Path
+from typing import List, Set, Tuple, Optional
+
 import numpy as np
+import pandas as pd
 
-def jaccard(a:set, b:set) -> float:
-    if not a and not b: return 1.0
-    if not a or not b:  return 0.0
-    return len(a & b) / len(a | b)
 
-def parse_set(s):
-    if pd.isna(s) or s == "": return set()
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True)
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--k", type=int, default=3, help="Top-K per pair")
+    ap.add_argument("--lambda", dest="lam", type=float, default=0.5,
+                    help="MMR lambda (0=only diversity, 1=only quality)")
+    ap.add_argument("--min-iface-diff", type=float, default=0.25,
+                    help="同一ペア内で別テンプレートとして扱う最小Jaccard距離(=1-Jaccard)")
+    ap.add_argument("--use-sasa-iface", action="store_true",
+                    help="ΔSASA由来 iface_sasa_* を優先使用（欠損時は距離由来にフォールバック）")
+
+    # base score weights
+    ap.add_argument("--w-dist", type=float, default=1.0,
+                    help="小さい距離ほど高スコア。1.6–4.5Åを中心に正規化")
+    ap.add_argument("--w-contacts", type=float, default=1.0,
+                    help="n_atom_contacts の log1p 正規化スコア重み")
+    ap.add_argument("--w-bsa", type=float, default=0.0,
+                    help="bsa_total の log1p 正規化スコア重み（ΔSASA付きデータ推奨）")
+
+    # diversity penalty weights
+    ap.add_argument("--w-iface", type=float, default=1.0,
+                    help="界面集合のJaccard類似ペナルティ重み")
+    ap.add_argument("--w-lig", type=float, default=0.3,
+                    help="同一リガンド有無の軽ペナルティ（has_ligand列があれば使用）")
+    ap.add_argument("--w-same-pdb", type=float, default=0.2,
+                    help="同一PDBの軽ペナルティ")
+    ap.add_argument("--w-same-asm", type=float, default=0.2,
+                    help="同一assembly_idの軽ペナルティ（列がある場合のみ）")
+    return ap.parse_args()
+
+
+# ------------------------ helpers ------------------------
+
+def _safe_set_from_str(s: str) -> Set[str]:
+    if pd.isna(s) or s == "":
+        return set()
     return set(str(s).split(","))
 
-def compute_base_score(row, w_dist=1.0, w_contacts=1.0, w_pident=0.0, w_resol=0.0):
-    dist = float(row.get("min_atom_distance", 10.0))
-    ncnt = float(row.get("n_atom_contacts", 0.0))
-    pid  = float(row.get("pident_mean", 0.0)) if not pd.isna(row.get("pident_mean", np.nan)) else 0.0
-    resol = float(row.get("resol", 0.0)) if not pd.isna(row.get("resol", np.nan)) else 0.0
-    # 小さい距離＆多い接触を優先。分解能は小さいほど良いのでマイナス符号。
-    score = w_dist * (-min(dist, 10.0)) + w_contacts * math.log1p(max(ncnt, 0.0)) \
-            + w_pident * pid - w_resol * resol
-    return score
 
-def mmr_select(rows, K=3, lam=0.5,
-               w_iface=1.0, w_lig=0.3, w_same_pdb=0.2, w_same_asm=0.2,
-               min_iface_diff=0.0):
+def _jaccard(a: Set[str], b: Set[str]) -> float:
+    if not a and not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return 0.0 if union == 0 else inter / union
+
+
+def _norm01(series: pd.Series) -> pd.Series:
+    # robust min-max with fallback
+    s = pd.to_numeric(series, errors="coerce")
+    vmin, vmax = s.min(), s.max()
+    if pd.isna(vmin) or pd.isna(vmax) or vmax <= vmin:
+        return pd.Series(np.zeros(len(series)), index=series.index, dtype=float)
+    return (s - vmin) / (vmax - vmin)
+
+
+def _dist_to_score(d: pd.Series) -> pd.Series:
     """
-    rows: list[dict] 同一 (uniprot_a, uniprot_b) の候補
-    lam: 多様性重み（大きいほど多様性重視）
-    min_iface_diff: 0.0〜1.0。選出済みとJaccardが高すぎる候補を弾くための下限距離（=1-類似度）。
-                    例: 0.25 を指定 → 類似度 0.75 超は落とす（インターフェースがほぼ同じなら弾く）
+    小さいほどよい距離を [0,1] のスコアに変換。
+    目安: 1.6Å(最良)〜4.5Å(許容下限)で線形に落ちるクリップ。
     """
-    # base_score で1つ目
-    rows = rows.copy()
-    rows.sort(key=lambda r: r["base_score"], reverse=True)
-    chosen = []
-    if rows:
-        chosen.append(rows.pop(0))
+    x = pd.to_numeric(d, errors="coerce")
+    s = 1.0 - (x - 1.6) / (4.5 - 1.6)
+    s = s.clip(lower=0.0, upper=1.0).fillna(0.0)
+    return s
 
-    # 2つ目以降: base_score - lam * sim_max を最大化
-    def lig_key(r):
-        return (r.get("has_ligand", False), r.get("ligand_class", "NA"))
 
-    while len(chosen) < K and rows:
-        best = None
-        best_val = -1e9
-        for c in rows:
-            # 類似度（最大）を計算
-            sim_max = 0.0
-            too_similar = False
-            for s in chosen:
-                ia = jaccard(c["iface_a"], s["iface_a"])
-                ib = jaccard(c["iface_b"], s["iface_b"])
-                iface_sim = (ia + ib) / 2.0
-                # 類似しすぎを強制的に弾く（多様性確保）
-                if min_iface_diff > 0.0 and (1.0 - iface_sim) < min_iface_diff:
-                    too_similar = True
-                    break
-                lig_sim = 1.0 if lig_key(c) == lig_key(s) else 0.0
-                same_pdb = 1.0 if str(c["pdb_id"]).upper()==str(s["pdb_id"]).upper() else 0.0
-                same_asm = 1.0 if c.get("assembly_id") and c.get("assembly_id")==s.get("assembly_id") else 0.0
-                sim = w_iface*iface_sim + w_lig*lig_sim + w_same_pdb*same_pdb + w_same_asm*same_asm
-                sim_max = max(sim_max, sim)
-            if too_similar:
+def _log1p_norm(x: pd.Series) -> pd.Series:
+    s = pd.to_numeric(x, errors="coerce").fillna(0)
+    s = np.log1p(s)
+    return _norm01(pd.Series(s, index=x.index))
+
+
+def _choose_iface_sets(row, use_sasa: bool) -> Tuple[Set[str], Set[str], str]:
+    src = "dist"
+    if use_sasa:
+        ia = _safe_set_from_str(row.get("iface_sasa_a", ""))
+        ib = _safe_set_from_str(row.get("iface_sasa_b", ""))
+        if ia or ib:
+            return ia, ib, "sasa"
+        # フォールバック
+    ia = _safe_set_from_str(row.get("iface_res_a", ""))
+    ib = _safe_set_from_str(row.get("iface_res_b", ""))
+    return ia, ib, src
+
+
+def _mmr_select(group_df: pd.DataFrame,
+                k: int,
+                lam: float,
+                min_iface_diff: float,
+                w_iface: float,
+                w_lig: float,
+                w_same_pdb: float,
+                w_same_asm: float,
+                use_sasa_iface: bool) -> pd.DataFrame:
+    """
+    1ペアの候補から Top-K をMMRで選ぶ。group_df は同一 (uniprot_a, uniprot_b) のみ。
+    返り値は選抜行のみ（rank/score列付き）。
+    """
+    if group_df.empty:
+        return group_df
+
+    # 事前に界面集合とソースを作る
+    iface_a, iface_b, srcs = [], [], []
+    for _, r in group_df.iterrows():
+        ia, ib, src = _choose_iface_sets(r, use_sasa_iface)
+        iface_a.append(ia); iface_b.append(ib); srcs.append(src)
+
+    G = group_df.copy()
+    G["_iface_a"] = iface_a
+    G["_iface_b"] = iface_b
+    G["_iface_src"] = srcs
+
+    # 類似度（Jaccard）はA/B両側の平均で代表
+    def iface_sim(i, j) -> float:
+        ja = _jaccard(G["_iface_a"].iat[i], G["_iface_a"].iat[j])
+        jb = _jaccard(G["_iface_b"].iat[i], G["_iface_b"].iat[j])
+        return 0.5 * (ja + jb)
+
+    # 多様性“追加”ペナルティ（同一PDB/同一Asm/同一Lig）
+    def extra_pen(i, j) -> float:
+        pen = 0.0
+        if w_same_pdb != 0:
+            pen += w_same_pdb * (G["pdb_id"].iat[i] == G["pdb_id"].iat[j])
+        if w_same_asm != 0 and "assembly_id" in G.columns:
+            a = G["assembly_id"].iat[i]; b = G["assembly_id"].iat[j]
+            pen += w_same_asm * (pd.notna(a) and pd.notna(b) and a == b)
+        if w_lig != 0 and "has_ligand" in G.columns:
+            a = str(G["has_ligand"].iat[i]); b = str(G["has_ligand"].iat[j])
+            pen += w_lig * (a == b and a != "nan")
+        return float(pen)
+
+    # MMR本体
+    selected_idx: List[int] = []
+    avail = list(range(len(G)))
+
+    # 先頭は base_score 最大を選ぶ
+    first = int(np.argmax(G["base_score"].values))
+    selected_idx.append(first)
+    avail.remove(first)
+
+    while avail and len(selected_idx) < k:
+        best_cand = None
+        best_score = -1e9
+        for idx in avail:
+            # 類似度（=1-距離）と追加ペナ
+            sim = 0.0
+            for j in selected_idx:
+                sim += w_iface * iface_sim(idx, j) + extra_pen(idx, j)
+            if selected_idx:
+                sim /= len(selected_idx)
+            # MMR: λ*quality − (1−λ)*similarity
+            mmr = lam * G["base_score"].iat[idx] - (1.0 - lam) * sim
+            if mmr > best_score:
+                best_score = mmr
+                best_cand = idx
+        selected_idx.append(best_cand)
+        avail.remove(best_cand)
+
+    S = G.iloc[selected_idx].copy()
+    # rankと最終スコア（再計算して付与）
+    ranks, finals, divs, src = [], [], [], []
+    for rpos, ridx in enumerate(selected_idx, start=1):
+        sim = 0.0
+        for j in selected_idx[:rpos-1]:
+            sim += w_iface * iface_sim(ridx, j) + extra_pen(ridx, j)
+        if rpos > 1:
+            sim /= (rpos - 1)
+        mmr = lam * G["base_score"].iat[ridx] - (1.0 - lam) * sim
+        ranks.append(rpos); finals.append(mmr); divs.append(sim); src.append(G["_iface_src"].iat[ridx])
+
+    S["rank"] = ranks
+    S["final_score"] = finals
+    S["div_penalty"] = divs
+    S["iface_source"] = src
+
+    # オプション: ほぼ同一界面（Jaccard距離 < min_iface_diff）は同一扱い → 下位を落とす
+    keep_mask = [True]*len(S)
+    for i in range(len(S)):
+        if not keep_mask[i]:
+            continue
+        for j in range(i+1, len(S)):
+            if not keep_mask[j]:
                 continue
-            val = c["base_score"] - lam * sim_max
-            if val > best_val:
-                best_val, best = val, c
-        if best is None:
-            break
-        chosen.append(best)
-        rows.remove(best)
-    return chosen
+            # 距離 = 1 - 類似度
+            ja = _jaccard(S["_iface_a"].iat[i], S["_iface_a"].iat[j])
+            jb = _jaccard(S["_iface_b"].iat[i], S["_iface_b"].iat[j])
+            dist = 1.0 - 0.5*(ja+jb)
+            if dist < min_iface_diff:
+                # 類似過多 → 下位（スコア低い方）を落とす
+                if S["final_score"].iat[i] >= S["final_score"].iat[j]:
+                    keep_mask[j] = False
+                else:
+                    keep_mask[i] = False
+                    break
+    S = S.loc[keep_mask].sort_values(["final_score","base_score"], ascending=[False,False])
+    return S.head(k)
+
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--input", required=True, help="contacts TSV")
-    ap.add_argument("--output", required=True, help="topK diverse TSV")
-    ap.add_argument("--k", type=int, default=3)
-    ap.add_argument("--lambda", dest="lam", type=float, default=0.5)
-    ap.add_argument("--min-iface-diff", type=float, default=0.0, help="0〜1。大きいほど多様性を強制")
-    # base_score の重み
-    ap.add_argument("--w-dist", type=float, default=1.0)
-    ap.add_argument("--w-contacts", type=float, default=1.0)
-    ap.add_argument("--w-pident", type=float, default=0.0)
-    ap.add_argument("--w-resol", type=float, default=0.0)
-    # 類似度の重み
-    ap.add_argument("--w-iface", type=float, default=1.0)
-    ap.add_argument("--w-lig", type=float, default=0.3)
-    ap.add_argument("--w-same-pdb", type=float, default=0.2)
-    ap.add_argument("--w-same-asm", type=float, default=0.2)
-    args = ap.parse_args()
+    args = parse_args()
+    inp = Path(args.input)
+    outp = Path(args.output)
 
-    df = pd.read_csv(args.input, sep="\t")
-
-    # 必須列チェック
-    need = {"uniprot_a","uniprot_b","pdb_id","chain_id_a","chain_id_b",
-            "min_atom_distance","n_atom_contacts","iface_res_a","iface_res_b"}
+    df = pd.read_csv(inp, sep="\t", low_memory=False)
+    need = {"uniprot_a","uniprot_b","pdb_id","chain_id_a","chain_id_b"}
     miss = need - set(df.columns)
     if miss:
-        raise SystemExit(f"Missing required columns: {miss}")
+        raise SystemExit(f"[ERROR] missing columns: {sorted(miss)}")
 
-    # セット化
-    df = df.copy()
-    df["iface_a"] = df["iface_res_a"].map(parse_set)
-    df["iface_b"] = df["iface_res_b"].map(parse_set)
+    # ベーススコアの構築
+    # 距離
+    dist_score = _dist_to_score(df.get("min_atom_distance", pd.Series([np.nan]*len(df))))
+    dist_score *= float(args.w_dist)
 
-    # base_score
-    df["base_score"] = df.apply(
-        lambda r: compute_base_score(
-            r, w_dist=args.w_dist, w_contacts=args.w_contacts,
-            w_pident=args.w_pident, w_resol=args.w_resol
-        ),
-        axis=1
-    )
+    # 接触
+    contacts_score = _log1p_norm(df.get("n_atom_contacts", pd.Series([0]*len(df))))
+    contacts_score *= float(args.w_contacts)
 
-    out_rows = []
-    for (ua, ub), g in df.groupby(["uniprot_a","uniprot_b"], sort=False):
-        rows = g.to_dict(orient="records")
-        chosen = mmr_select(
-            rows, K=args.k, lam=args.lam,
-            w_iface=args.w_iface, w_lig=args.w_lig,
-            w_same_pdb=args.w_same_pdb, w_same_asm=args.w_same_asm,
-            min_iface_diff=args.min_iface_diff
+    # BSA
+    bsa_col = df.get("bsa_total", pd.Series([np.nan]*len(df)))
+    bsa_score = _log1p_norm(bsa_col.fillna(0))
+    bsa_score *= float(args.w_bsa)
+
+    base = dist_score.add(contacts_score, fill_value=0).add(bsa_score, fill_value=0)
+    df["base_score"] = base.fillna(0.0)
+
+    # 1ペアごとのMMR選抜
+    groups = df.groupby(["uniprot_a","uniprot_b"], sort=False)
+    picks = []
+    for (ua, ub), g in groups:
+        sel = _mmr_select(
+            g, k=int(args.k), lam=float(args.lam),
+            min_iface_diff=float(args.min_iface_diff),
+            w_iface=float(args.w_iface),
+            w_lig=float(args.w_lig),
+            w_same_pdb=float(args.w_same_pdb),
+            w_same_asm=float(args.w_same_asm),
+            use_sasa_iface=bool(args.use_sasa_iface)
         )
-        out_rows.extend(chosen)
+        picks.append(sel)
 
-    out_df = pd.DataFrame(out_rows)
-    # 並べ替え（対称重複を避けるため一応正規化キー付け、必要なら解除）
-    out_df["sort_key"] = out_df["uniprot_a"] + "_" + out_df["uniprot_b"] + "_" + out_df["pdb_id"].astype(str)
-    out_df = out_df.sort_values(["uniprot_a","uniprot_b","base_score"], ascending=[True,True,False]).drop(columns=["sort_key"])
-    out_df.to_csv(args.output, sep="\t", index=False)
-    print(f"[INFO] written: {args.output}  rows={len(out_df)}")
+    if picks:
+        out = pd.concat(picks, axis=0, ignore_index=True)
+    else:
+        out = df.iloc[0:0].copy()
+
+    # 内部列を整える
+    drop_tmp = ["_iface_a","_iface_b","_iface_src"]
+    for c in drop_tmp:
+        if c in out.columns:
+            out.drop(columns=[c], inplace=True)
+
+    out.sort_values(["uniprot_a","uniprot_b","rank"], inplace=True)
+    outp.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(outp, sep="\t", index=False)
+
+    # ログ風の出力
+    n_pairs = df[["uniprot_a","uniprot_b"]].drop_duplicates().shape[0]
+    n_out_pairs = out[["uniprot_a","uniprot_b"]].drop_duplicates().shape[0]
+    print(f"[INFO] input rows: {len(df)}  pairs: {n_pairs}")
+    print(f"[INFO] written: {outp}  rows: {len(out)}  pairs: {n_out_pairs}")
+    if "bsa_total" in out.columns:
+        print(out[["bsa_total"]].describe())
+
 
 if __name__ == "__main__":
     main()
