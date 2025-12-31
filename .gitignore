@@ -18,8 +18,9 @@ data/interim/
 data/processed/*.sqlite
 data/processed/*.h5
 data/processed/*.pkl
-data/processed/*.json
-data/processed/*.jsonl
+data/processed/interfaces/*.json
+data/processed/interfaces/*.jsonl
+
 
 # Results (重いもの)
 results/logs/
