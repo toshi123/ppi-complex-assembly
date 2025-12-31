@@ -50,6 +50,15 @@ def parse_args():
     p.add_argument("--log-every", type=int, default=2000)
     return p.parse_args()
 
+def extract_uniprot_ac(s: str) -> str:
+    """Extract UniProt accession from formats like 'sp|P12345|NAME' or 'tr|A0A024QYR6|NAME' -> 'P12345' or 'A0A024QYR6'"""
+    s = str(s).strip()
+    if '|' in s:
+        parts = s.split('|')
+        if len(parts) >= 2:
+            return parts[1]
+    return s
+
 def load_uniprot_fasta(fasta_path: str) -> dict:
     seqs = {}
     def _open(path):
@@ -62,7 +71,9 @@ def load_uniprot_fasta(fasta_path: str) -> dict:
                 if ac and buf:
                     seqs[ac] = "".join(buf).replace("\n","").strip()
                 header = line[1:].strip()
-                ac = header.split()[0]
+                # Extract accession from 'sp|P12345|NAME' or 'tr|A0A024QYR6|NAME' format
+                raw_ac = header.split()[0]
+                ac = extract_uniprot_ac(raw_ac)
                 buf = []
             else:
                 buf.append(line.strip())
@@ -93,9 +104,17 @@ def build_sifts_index(sifts_df: pd.DataFrame):
     needed = {"PDB","CHAIN","SP_PRIMARY","PDB_BEG","PDB_END","SP_BEG","SP_END"}
     if not needed.issubset(set(sifts_df.columns)):
         raise ValueError(f"SIFTS columns missing. Need {needed}, got {list(sifts_df.columns)}")
-    for col in ["PDB_BEG","PDB_END","SP_BEG","SP_END"]:
-        sifts_df[col] = pd.to_numeric(sifts_df[col], errors="coerce")
-    sifts_df = sifts_df.dropna(subset=list(needed))
+    # Convert numeric columns (None string -> NaN)
+    for col in ["RES_BEG","RES_END","PDB_BEG","PDB_END","SP_BEG","SP_END"]:
+        if col in sifts_df.columns:
+            sifts_df[col] = pd.to_numeric(sifts_df[col], errors="coerce")
+    # Fallback: use RES_BEG/RES_END if PDB_BEG/PDB_END are missing
+    if "RES_BEG" in sifts_df.columns:
+        sifts_df["PDB_BEG"] = sifts_df["PDB_BEG"].fillna(sifts_df["RES_BEG"])
+    if "RES_END" in sifts_df.columns:
+        sifts_df["PDB_END"] = sifts_df["PDB_END"].fillna(sifts_df["RES_END"])
+    # Only drop rows missing SP_BEG/SP_END (required for UniProt mapping)
+    sifts_df = sifts_df.dropna(subset=["PDB","CHAIN","SP_PRIMARY","SP_BEG","SP_END","PDB_BEG","PDB_END"])
     sifts_df[["PDB_BEG","PDB_END","SP_BEG","SP_END"]] = sifts_df[["PDB_BEG","PDB_END","SP_BEG","SP_END"]].astype(int)
     for _, r in sifts_df.iterrows():
         key = (str(r["PDB"]).lower(), str(r["CHAIN"]), str(r["SP_PRIMARY"]))
