@@ -286,6 +286,32 @@ def pdb_to_sp_pos(pdb_pos: int, ranges) -> int | None:
 
 # -------------------- SASA計算 --------------------
 
+def is_polymer_residue(res: gemmi.Residue) -> bool:
+    """
+    残基がポリマー（タンパク質/核酸）かどうかを判定。
+    gemmiのバージョン互換性を考慮。
+    """
+    # 方法1: is_polymer() メソッドがあれば使う
+    if hasattr(res, 'is_polymer'):
+        try:
+            return res.is_polymer()
+        except Exception:
+            pass
+    
+    # 方法2: het_flag で判定（'A' = ATOM = ポリマー、'H' = HETATM = 非ポリマー）
+    if hasattr(res, 'het_flag'):
+        return res.het_flag == 'A'
+    
+    # 方法3: 残基名で判定（標準アミノ酸 + 核酸）
+    standard_residues = {
+        'ALA', 'ARG', 'ASN', 'ASP', 'CYS', 'GLN', 'GLU', 'GLY', 'HIS', 'ILE',
+        'LEU', 'LYS', 'MET', 'PHE', 'PRO', 'SER', 'THR', 'TRP', 'TYR', 'VAL',
+        'A', 'C', 'G', 'T', 'U', 'DA', 'DC', 'DG', 'DT', 'DU',
+        'MSE', 'SEC', 'PYL',  # 修飾アミノ酸
+    }
+    return res.name in standard_residues
+
+
 def write_chain_to_pdb(model: gemmi.Model, chain_id: str, out_pdb: Path):
     """指定チェーンのポリマー残基のみをPDBファイルに書き出す"""
     st = gemmi.Structure()
@@ -295,7 +321,7 @@ def write_chain_to_pdb(model: gemmi.Model, chain_id: str, out_pdb: Path):
     if chain_id in names:
         new_c = gemmi.Chain(chain_id)
         for res in model[chain_id]:
-            if res.is_polymer():
+            if is_polymer_residue(res):
                 new_c.add_residue(res)
         if len(new_c):
             m.add_chain(new_c)
