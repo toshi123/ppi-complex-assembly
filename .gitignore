@@ -20,6 +20,8 @@ data/processed/*.h5
 data/processed/*.pkl
 data/processed/interfaces/*.json
 data/processed/interfaces/*.jsonl
+data/processed/*.json
+data/processed/*.jsonl
 
 
 # Results (重いもの)
