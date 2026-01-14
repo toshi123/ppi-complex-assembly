@@ -55,12 +55,59 @@ CANDIDATE_IFACE_B = ["iface_sasa_b", "iface_res_b"]
 
 # -------------------- ファイル読み込みユーティリティ --------------------
 
+def resolve_symlink(path: Path) -> Path:
+    """
+    シンボリックリンクを解決する。
+    macOSで作成されたシンボリックリンクがLinuxで壊れている場合の検出も行う。
+    """
+    path = Path(path)
+    
+    # シンボリックリンクの場合は解決を試みる
+    if path.is_symlink():
+        try:
+            resolved = path.resolve()
+            if resolved.exists():
+                return resolved
+        except Exception:
+            pass
+    
+    # ファイルの先頭を確認（macOSシンボリックリンクのメタデータ検出）
+    if path.exists():
+        try:
+            with open(path, 'rb') as f:
+                header = f.read(10)
+            if header.startswith(b'XSym'):
+                # macOSシンボリックリンクのメタファイル
+                # 実際のリンク先を読み取る
+                with open(path, 'r') as f:
+                    lines = f.readlines()
+                if len(lines) >= 4:
+                    target = lines[3].strip()
+                    target_path = path.parent / target
+                    if target_path.exists():
+                        logging.warning(f"Resolved macOS symlink: {path} -> {target_path}")
+                        return target_path
+                raise ValueError(
+                    f"File appears to be a macOS symlink metadata file: {path}\n"
+                    f"Please specify the actual file path instead of the symlink.\n"
+                    f"Try: ls -la {path.parent}/ to find the actual file."
+                )
+        except ValueError:
+            raise
+        except Exception:
+            pass
+    
+    return path
+
+
 def read_csv_auto(path, **kwargs):
     """
     gzip圧縮かどうかをマジックバイトで自動判定してCSVを読み込む。
     拡張子が.gzでも実際に非圧縮の場合に対応。
+    シンボリックリンクも解決する。
     """
-    path = Path(path)
+    path = resolve_symlink(Path(path))
+    
     # マジックバイトでgzipかどうか判定
     with open(path, 'rb') as f:
         magic = f.read(2)
@@ -95,6 +142,8 @@ def parse_args():
     p.add_argument("--log-every", type=int, default=100)
     p.add_argument("--suppress-stderr", action="store_true", default=True,
                    help="Suppress FreeSASA stderr")
+    p.add_argument("--debug", action="store_true",
+                   help="Enable debug logging for SASA computation")
     return p.parse_args()
 
 # -------------------- stderr抑制 --------------------
@@ -363,7 +412,8 @@ def compute_sasa_for_uniprot(
     pdb_sources: list,
     sifts_idx: dict,
     pdb_dir: Path,
-    suppress_stderr: bool
+    suppress_stderr: bool,
+    debug: bool = False
 ) -> dict:
     """
     UniProtの各残基位置についてSASAを計算（複数PDBソースから最良値を採用）。
@@ -373,16 +423,25 @@ def compute_sasa_for_uniprot(
     tmpdir = Path(".tmp_sasa")
     tmpdir.mkdir(exist_ok=True)
     
+    if not pdb_sources:
+        if debug:
+            logging.debug(f"  {uniprot_id}: no PDB sources")
+        return residue_sasa
+    
     for pdb_id, chain_id in pdb_sources:
         struct_path = find_structure_path(pdb_id, pdb_dir)
         if struct_path is None:
+            if debug:
+                logging.debug(f"  {uniprot_id}: structure not found for {pdb_id}")
             continue
         
         try:
             st = gemmi.read_structure(str(struct_path))
             st.remove_waters()
             model = st[0]
-        except Exception:
+        except Exception as e:
+            if debug:
+                logging.debug(f"  {uniprot_id}: failed to read {pdb_id}: {e}")
             continue
         
         # チェーンをPDBに書き出し
@@ -390,7 +449,11 @@ def compute_sasa_for_uniprot(
         try:
             write_chain_to_pdb(model, chain_id, tmp_pdb)
             pdb_res_sasa = compute_residue_sasa(tmp_pdb, suppress_stderr)
-        except Exception:
+            if debug and not pdb_res_sasa:
+                logging.debug(f"  {uniprot_id}: empty SASA result for {pdb_id}_{chain_id}")
+        except Exception as e:
+            if debug:
+                logging.debug(f"  {uniprot_id}: SASA calc failed for {pdb_id}_{chain_id}: {e}")
             continue
         finally:
             try:
@@ -400,6 +463,8 @@ def compute_sasa_for_uniprot(
         
         # SIFTSでUniProt位置にマッピング
         ranges = sifts_idx.get((pdb_id, chain_id, uniprot_id), [])
+        if debug and not ranges:
+            logging.debug(f"  {uniprot_id}: no SIFTS ranges for ({pdb_id}, {chain_id}, {uniprot_id})")
         if not ranges:
             continue
         
@@ -431,7 +496,8 @@ def compute_sasa_for_uniprot(
 
 def main():
     args = parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+    log_level = logging.DEBUG if args.debug else logging.INFO
+    logging.basicConfig(level=log_level, format="%(levelname)s: %(message)s")
     
     # 入力TSV読み込み
     logging.info(f"Reading input: {args.input}")
@@ -497,7 +563,8 @@ def main():
             # SASA計算
             sources = pdb_sources.get(uniprot_id, [])
             residue_sasa = compute_sasa_for_uniprot(
-                uniprot_id, sources, sifts_idx, pdb_dir, args.suppress_stderr
+                uniprot_id, sources, sifts_idx, pdb_dir, args.suppress_stderr,
+                debug=args.debug
             )
             
             if not residue_sasa:
