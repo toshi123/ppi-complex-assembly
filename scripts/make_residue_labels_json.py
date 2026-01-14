@@ -53,6 +53,23 @@ MAX_SASA = {
 CANDIDATE_IFACE_A = ["iface_sasa_a", "iface_res_a"]
 CANDIDATE_IFACE_B = ["iface_sasa_b", "iface_res_b"]
 
+# -------------------- ファイル読み込みユーティリティ --------------------
+
+def read_csv_auto(path, **kwargs):
+    """
+    gzip圧縮かどうかをマジックバイトで自動判定してCSVを読み込む。
+    拡張子が.gzでも実際に非圧縮の場合に対応。
+    """
+    path = Path(path)
+    # マジックバイトでgzipかどうか判定
+    with open(path, 'rb') as f:
+        magic = f.read(2)
+    
+    if magic == b'\x1f\x8b':  # gzip magic number
+        return pd.read_csv(path, compression='gzip', **kwargs)
+    else:
+        return pd.read_csv(path, compression=None, **kwargs)
+
 # -------------------- CLI --------------------
 
 def parse_args():
@@ -439,9 +456,9 @@ def main():
                     df[col] = df[col].where(df[col].notna(), df[f"{col}_up"])
                     df = df.drop(columns=[f"{col}_up"])
     
-    # SIFTS読み込み
+    # SIFTS読み込み（gzip自動判定）
     logging.info(f"Reading SIFTS: {args.sifts}")
-    sifts_df = pd.read_csv(args.sifts, comment='#', low_memory=False)
+    sifts_df = read_csv_auto(args.sifts, comment='#', low_memory=False)
     sifts_idx = build_sifts_index(sifts_df)
     
     # UniProt配列読み込み
