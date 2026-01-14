@@ -509,8 +509,12 @@ def compute_sasa_for_uniprot(
             sasa = data["sasa"]
             rsa = compute_rsa(sasa, aa)
             
-            # 既存より大きいSASAを採用（より露出した状態を優先）
-            if sp_pos not in residue_sasa or (rsa and rsa > residue_sasa[sp_pos].get("rsa", 0)):
+            # 既存より大きいRSAを採用（より露出した状態を優先）
+            # Noneの場合は0として比較
+            existing_rsa = residue_sasa.get(sp_pos, {}).get("rsa")
+            existing_rsa = existing_rsa if existing_rsa is not None else 0
+            
+            if sp_pos not in residue_sasa or (rsa is not None and rsa > existing_rsa):
                 residue_sasa[sp_pos] = {
                     "sasa": sasa,
                     "rsa": rsa,
