@@ -5,19 +5,22 @@ make_residue_labels_json.py
 各タンパク質（UniProt ID）について、残基ごとに以下のラベルを付与したJSONLを出力する：
   - surface: 表面残基（RSA > 閾値）
   - buried: 埋没残基（RSA ≤ 閾値）
-  - interface: インターフェース残基（PPIで接触）
+  - unknown: SASA計算不可（PDB構造なし等）
 
 処理:
-1. TSVからインターフェース残基を収集（全相互作用相手を統合）
-2. PDB構造から単独チェーンのSASAを計算（FreeSASA）
-3. RSA（相対SASA）で surface/buried を判定
-4. interface はTSVの iface_res_*/iface_sasa_* から取得
-5. ラベルの優先順位: interface > surface > buried
+1. TSVからPPIに関与するUniProt IDを収集
+2. SIFTSから各UniProtに**直接対応する**PDB構造を探す（ホモログではなく）
+3. PDB構造からSASAを計算（FreeSASA）
+4. RSA（相対SASA）で surface/buried を判定
+
+注意:
+- インターフェース残基は「ホモログ構造由来」のため位置は不確定
+- surface残基のどこかにインターフェースがあると考える
+- 相互作用パートナー情報はメタデータとして保持
 
 使い方:
 python scripts/make_residue_labels_json.py \
   --input  data/interim/intact_pairs_with_pdb_contacts_topk_diverse.tsv \
-  --upstream data/interim/intact_pairs_with_pdb_contacts.tight_bsa.band.tsv \
   --sifts   data/raw/pdb_chain_uniprot_current.csv.gz \
   --fasta   data/raw/uniprot_human_all_20251110.fasta \
   --pdb-dir data/raw/pdb_structures \
@@ -50,6 +53,7 @@ MAX_SASA = {
     'S': 122.0, 'T': 146.0, 'W': 259.0, 'Y': 229.0, 'V': 160.0,
 }
 
+# インターフェース列（参考情報として保持、ラベル付けには使わない）
 CANDIDATE_IFACE_A = ["iface_sasa_a", "iface_res_a"]
 CANDIDATE_IFACE_B = ["iface_sasa_b", "iface_res_b"]
 
@@ -284,6 +288,63 @@ def pdb_to_sp_pos(pdb_pos: int, ranges) -> int | None:
                 return sp
     return None
 
+
+def build_uniprot_to_pdb_index(sifts_df: pd.DataFrame) -> dict:
+    """
+    SIFTS DataFrame から UniProt ID → [(pdb_id, chain_id, ranges), ...] の逆引きindexを構築。
+    UniProtに直接対応するPDB構造を探すために使用。
+    """
+    idx = defaultdict(list)
+    needed = {"PDB", "CHAIN", "SP_PRIMARY", "SP_BEG", "SP_END"}
+    if not needed.issubset(set(sifts_df.columns)):
+        return idx
+    
+    for col in ["RES_BEG", "RES_END", "PDB_BEG", "PDB_END", "SP_BEG", "SP_END"]:
+        if col in sifts_df.columns:
+            sifts_df[col] = pd.to_numeric(sifts_df[col], errors="coerce")
+    
+    # PDB_BEG/END のフォールバック
+    if "RES_BEG" in sifts_df.columns and "PDB_BEG" in sifts_df.columns:
+        sifts_df["PDB_BEG"] = sifts_df["PDB_BEG"].fillna(sifts_df["RES_BEG"])
+    if "RES_END" in sifts_df.columns and "PDB_END" in sifts_df.columns:
+        sifts_df["PDB_END"] = sifts_df["PDB_END"].fillna(sifts_df["RES_END"])
+    
+    required_cols = ["PDB", "CHAIN", "SP_PRIMARY", "SP_BEG", "SP_END"]
+    if "PDB_BEG" in sifts_df.columns and "PDB_END" in sifts_df.columns:
+        required_cols += ["PDB_BEG", "PDB_END"]
+    
+    sifts_clean = sifts_df.dropna(subset=required_cols).copy()
+    
+    # UniProt IDごとにPDB/チェーン情報を集約
+    for uniprot_id, group in sifts_clean.groupby("SP_PRIMARY"):
+        pdb_chains = {}
+        for _, r in group.iterrows():
+            pdb_id = str(r["PDB"]).lower()
+            chain_id = str(r["CHAIN"])
+            key = (pdb_id, chain_id)
+            
+            pdb_beg = int(r.get("PDB_BEG", r.get("SP_BEG", 1)))
+            pdb_end = int(r.get("PDB_END", r.get("SP_END", 1)))
+            sp_beg = int(r["SP_BEG"])
+            sp_end = int(r["SP_END"])
+            
+            if key not in pdb_chains:
+                pdb_chains[key] = []
+            pdb_chains[key].append((pdb_beg, pdb_end, sp_beg, sp_end))
+        
+        # カバレッジの広いものを優先（sp_end - sp_beg の合計）
+        ranked = []
+        for (pdb_id, chain_id), ranges in pdb_chains.items():
+            coverage = sum(sp_end - sp_beg + 1 for _, _, sp_beg, sp_end in ranges)
+            ranges_sorted = sorted(ranges, key=lambda t: t[0])
+            ranked.append((coverage, pdb_id, chain_id, ranges_sorted))
+        
+        # カバレッジ降順でソート
+        ranked.sort(key=lambda x: -x[0])
+        idx[str(uniprot_id)] = [(pdb_id, chain_id, ranges) for _, pdb_id, chain_id, ranges in ranked]
+    
+    return idx
+
 # -------------------- SASA計算 --------------------
 
 def is_polymer_residue(res: gemmi.Residue) -> bool:
@@ -369,96 +430,87 @@ def compute_rsa(sasa: float, aa: str) -> float | None:
 
 # -------------------- メイン処理 --------------------
 
-def collect_interface_residues(df: pd.DataFrame, sifts_idx: dict) -> dict:
+def collect_ppi_partners(df: pd.DataFrame) -> dict:
     """
-    TSVからインターフェース残基を収集し、UniProtごとに統合。
-    戻り値: {uniprot_id: set(uniprot_pos), ...}
+    TSVからPPIパートナー情報を収集。
+    戻り値: {uniprot_id: set(partner_uniprot_ids), ...}
     """
-    iface_a_col = pick_first_present(CANDIDATE_IFACE_A, df)
-    iface_b_col = pick_first_present(CANDIDATE_IFACE_B, df)
+    partners = defaultdict(set)
     
-    if not iface_a_col or not iface_b_col:
-        logging.warning("No interface residue columns found in input")
-        return {}
+    # カラム名の正規化（_x, _y サフィックス対応）
+    ua_col = None
+    ub_col = None
+    for col in df.columns:
+        if col in ["uniprot_a", "uniprot_a_x", "uniprot_a_y"]:
+            ua_col = col
+        if col in ["uniprot_b", "uniprot_b_x", "uniprot_b_y"]:
+            ub_col = col
     
-    uniprot_iface = defaultdict(set)
+    if not ua_col or not ub_col:
+        logging.warning("No uniprot_a/uniprot_b columns found")
+        return partners
     
     for _, r in df.iterrows():
-        ua = str(r["uniprot_a"])
-        ub = str(r["uniprot_b"])
-        pdb = str(r["pdb_id"]).lower()
-        ca = str(r["chain_id_a"])
-        cb = str(r["chain_id_b"])
-        
-        # A側
-        ra_pdb = normalize_res_list(r.get(iface_a_col))
-        ranges_a = sifts_idx.get((pdb, ca, ua), [])
-        for pdb_pos in ra_pdb:
-            sp_pos = pdb_to_sp_pos(pdb_pos, ranges_a)
-            if sp_pos:
-                uniprot_iface[ua].add(sp_pos)
-        
-        # B側
-        rb_pdb = normalize_res_list(r.get(iface_b_col))
-        ranges_b = sifts_idx.get((pdb, cb, ub), [])
-        for pdb_pos in rb_pdb:
-            sp_pos = pdb_to_sp_pos(pdb_pos, ranges_b)
-            if sp_pos:
-                uniprot_iface[ub].add(sp_pos)
+        ua = str(r[ua_col])
+        ub = str(r[ub_col])
+        partners[ua].add(ub)
+        partners[ub].add(ua)
     
-    return uniprot_iface
+    return partners
 
 
-def collect_pdb_sources(df: pd.DataFrame) -> dict:
+def collect_target_uniprots(df: pd.DataFrame) -> set:
     """
-    UniProtごとに使用可能なPDBソースを収集。
-    戻り値: {uniprot_id: [(pdb_id, chain_id), ...], ...}
+    TSVからラベル付け対象のUniProt IDを収集。
     """
-    sources = defaultdict(list)
+    uniprots = set()
     
-    for _, r in df.iterrows():
-        ua = str(r["uniprot_a"])
-        ub = str(r["uniprot_b"])
-        pdb = str(r["pdb_id"]).lower()
-        ca = str(r["chain_id_a"])
-        cb = str(r["chain_id_b"])
-        
-        sources[ua].append((pdb, ca))
-        sources[ub].append((pdb, cb))
+    # カラム名の正規化
+    for col in df.columns:
+        if col in ["uniprot_a", "uniprot_a_x", "uniprot_a_y"]:
+            uniprots.update(df[col].dropna().astype(str).unique())
+        if col in ["uniprot_b", "uniprot_b_x", "uniprot_b_y"]:
+            uniprots.update(df[col].dropna().astype(str).unique())
     
-    # 重複除去
-    for k in sources:
-        sources[k] = list(set(sources[k]))
-    
-    return sources
+    return uniprots
 
 
 def compute_sasa_for_uniprot(
     uniprot_id: str,
-    pdb_sources: list,
-    sifts_idx: dict,
+    uniprot_pdb_idx: dict,
     pdb_dir: Path,
     suppress_stderr: bool,
-    debug: bool = False
-) -> dict:
+    debug: bool = False,
+    max_structures: int = 5
+) -> tuple[dict, list]:
     """
-    UniProtの各残基位置についてSASAを計算（複数PDBソースから最良値を採用）。
-    戻り値: {uniprot_pos: {"sasa": float, "rsa": float, "aa": str}, ...}
+    UniProtに**直接対応する**PDB構造からSASAを計算。
+    SIFTSの逆引きインデックスを使用。
+    
+    戻り値: (
+        {uniprot_pos: {"sasa": float, "rsa": float, "aa": str}, ...},
+        [(pdb_id, chain_id), ...]  # 使用したPDBソース
+    )
     """
     residue_sasa = {}
+    used_sources = []
     tmpdir = Path(".tmp_sasa")
     tmpdir.mkdir(exist_ok=True)
     
+    # SIFTSから直接対応するPDB構造を取得
+    pdb_sources = uniprot_pdb_idx.get(uniprot_id, [])
+    
     if not pdb_sources:
         if debug:
-            logging.debug(f"  {uniprot_id}: no PDB sources")
-        return residue_sasa
+            logging.debug(f"  {uniprot_id}: no direct PDB structures in SIFTS")
+        return residue_sasa, used_sources
     
-    for pdb_id, chain_id in pdb_sources:
+    # カバレッジの高いものから順に処理（最大max_structures個）
+    for pdb_id, chain_id, ranges in pdb_sources[:max_structures]:
         struct_path = find_structure_path(pdb_id, pdb_dir)
         if struct_path is None:
             if debug:
-                logging.debug(f"  {uniprot_id}: structure not found for {pdb_id}")
+                logging.debug(f"  {uniprot_id}: structure file not found for {pdb_id}")
             continue
         
         try:
@@ -487,12 +539,10 @@ def compute_sasa_for_uniprot(
             except Exception:
                 pass
         
-        # SIFTSでUniProt位置にマッピング
-        ranges = sifts_idx.get((pdb_id, chain_id, uniprot_id), [])
-        if debug and not ranges:
-            logging.debug(f"  {uniprot_id}: no SIFTS ranges for ({pdb_id}, {chain_id}, {uniprot_id})")
-        if not ranges:
+        if not pdb_res_sasa:
             continue
+        
+        used_sources.append((pdb_id, chain_id))
         
         for pdb_res_num, data in pdb_res_sasa.items():
             # pdb_res_num は "123" のような文字列
@@ -510,7 +560,6 @@ def compute_sasa_for_uniprot(
             rsa = compute_rsa(sasa, aa)
             
             # 既存より大きいRSAを採用（より露出した状態を優先）
-            # Noneの場合は0として比較
             existing_rsa = residue_sasa.get(sp_pos, {}).get("rsa")
             existing_rsa = existing_rsa if existing_rsa is not None else 0
             
@@ -521,7 +570,7 @@ def compute_sasa_for_uniprot(
                     "aa": aa
                 }
     
-    return residue_sasa
+    return residue_sasa, used_sources
 
 
 def main():
@@ -533,45 +582,27 @@ def main():
     logging.info(f"Reading input: {args.input}")
     df = pd.read_csv(args.input, sep="\t")
     
-    # 上流TSVをマージ（インターフェース残基情報を補完）
-    for up_path in args.upstream:
-        if not Path(up_path).exists():
-            logging.warning(f"Upstream not found: {up_path}")
-            continue
-        up_df = pd.read_csv(up_path, sep="\t")
-        merge_keys = ["uniprot_a", "uniprot_b", "pdb_id", "chain_id_a", "chain_id_b"]
-        if not set(merge_keys).issubset(up_df.columns):
-            continue
-        
-        # 不足列を補完
-        for col in CANDIDATE_IFACE_A + CANDIDATE_IFACE_B:
-            if col not in df.columns and col in up_df.columns:
-                up_sub = up_df[merge_keys + [col]].drop_duplicates(subset=merge_keys)
-                df = df.merge(up_sub, on=merge_keys, how="left", suffixes=("", "_up"))
-                if f"{col}_up" in df.columns:
-                    df[col] = df[col].where(df[col].notna(), df[f"{col}_up"])
-                    df = df.drop(columns=[f"{col}_up"])
-    
     # SIFTS読み込み（gzip自動判定）
     logging.info(f"Reading SIFTS: {args.sifts}")
     sifts_df = read_csv_auto(args.sifts, comment='#', low_memory=False)
-    sifts_idx = build_sifts_index(sifts_df)
+    
+    # UniProt → PDB の逆引きインデックスを構築
+    logging.info("Building UniProt -> PDB index from SIFTS...")
+    uniprot_pdb_idx = build_uniprot_to_pdb_index(sifts_df.copy())
+    logging.info(f"  Found direct PDB structures for {len(uniprot_pdb_idx)} UniProt IDs in SIFTS")
     
     # UniProt配列読み込み
     logging.info(f"Reading UniProt FASTA: {args.fasta}")
     up_seqs = load_uniprot_fasta(args.fasta)
     
-    # インターフェース残基を収集
-    logging.info("Collecting interface residues from TSV...")
-    uniprot_iface = collect_interface_residues(df, sifts_idx)
-    logging.info(f"  Found interface info for {len(uniprot_iface)} UniProt IDs")
-    
-    # PDBソースを収集
-    pdb_sources = collect_pdb_sources(df)
+    # PPIパートナー情報を収集（メタデータ用）
+    logging.info("Collecting PPI partner info from TSV...")
+    ppi_partners = collect_ppi_partners(df)
+    logging.info(f"  Found PPI info for {len(ppi_partners)} UniProt IDs")
     
     # 対象UniProtリスト
-    all_uniprots = set(uniprot_iface.keys()) | set(pdb_sources.keys())
-    logging.info(f"Processing {len(all_uniprots)} UniProt IDs...")
+    target_uniprots = collect_target_uniprots(df)
+    logging.info(f"Processing {len(target_uniprots)} UniProt IDs...")
     
     # 出力
     out_path = Path(args.output)
@@ -579,35 +610,36 @@ def main():
     pdb_dir = Path(args.pdb_dir)
     
     n_written = 0
+    n_with_sasa = 0
     n_no_sasa = 0
     
     with open(out_path, "w") as fw:
-        for idx, uniprot_id in enumerate(sorted(all_uniprots)):
+        for idx, uniprot_id in enumerate(sorted(target_uniprots)):
             if (idx + 1) % args.log_every == 0:
-                logging.info(f"  Processed {idx + 1}/{len(all_uniprots)}")
+                logging.info(f"  Processed {idx + 1}/{len(target_uniprots)}")
             
             seq = up_seqs.get(uniprot_id)
             if seq is None:
                 continue
             
-            # SASA計算
-            sources = pdb_sources.get(uniprot_id, [])
-            residue_sasa = compute_sasa_for_uniprot(
-                uniprot_id, sources, sifts_idx, pdb_dir, args.suppress_stderr,
+            # SASA計算（SIFTSから直接対応するPDB構造を使用）
+            residue_sasa, used_sources = compute_sasa_for_uniprot(
+                uniprot_id, uniprot_pdb_idx, pdb_dir, args.suppress_stderr,
                 debug=args.debug
             )
             
-            if not residue_sasa:
+            if residue_sasa:
+                n_with_sasa += 1
+            else:
                 n_no_sasa += 1
             
-            # インターフェース残基
-            iface_positions = uniprot_iface.get(uniprot_id, set())
+            # PPIパートナー（メタデータ）
+            partners = list(ppi_partners.get(uniprot_id, set()))
             
-            # 各残基にラベル付け
+            # 各残基にラベル付け（surface/buried/unknownのみ）
             residue_labels = {}
             n_surface = 0
             n_buried = 0
-            n_interface = 0
             
             for pos in range(1, len(seq) + 1):
                 aa = seq[pos - 1]
@@ -615,11 +647,8 @@ def main():
                 rsa = sasa_info.get("rsa")
                 sasa = sasa_info.get("sasa")
                 
-                # ラベル決定（優先順位: interface > surface > buried）
-                if pos in iface_positions:
-                    label = "interface"
-                    n_interface += 1
-                elif rsa is not None:
+                # ラベル決定（surface/buried/unknown）
+                if rsa is not None:
                     if rsa > args.rsa_threshold:
                         label = "surface"
                         n_surface += 1
@@ -640,7 +669,7 @@ def main():
             
             # サマリ
             n_total = len(seq)
-            n_unknown = n_total - n_surface - n_buried - n_interface
+            n_unknown = n_total - n_surface - n_buried
             
             rec = {
                 "uniprot_id": uniprot_id,
@@ -651,13 +680,18 @@ def main():
                     "n_total": n_total,
                     "n_surface": n_surface,
                     "n_buried": n_buried,
-                    "n_interface": n_interface,
                     "n_unknown": n_unknown,
                     "surface_frac": round(n_surface / n_total, 3) if n_total > 0 else 0,
                     "buried_frac": round(n_buried / n_total, 3) if n_total > 0 else 0,
-                    "interface_frac": round(n_interface / n_total, 3) if n_total > 0 else 0,
                 },
-                "pdb_sources": [f"{p}_{c}" for p, c in sources],
+                "pdb_sources": [f"{p}_{c}" for p, c in used_sources],
+                "ppi_info": {
+                    "has_ppi": len(partners) > 0,
+                    "n_partners": len(partners),
+                    "partners": sorted(partners),
+                    "interface_note": "Interface residues are located within surface residues, but exact positions are not determined (derived from homolog structures)."
+                    if partners else None
+                },
             }
             
             fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -665,7 +699,8 @@ def main():
     
     logging.info(f"Written: {out_path}")
     logging.info(f"  Total proteins: {n_written}")
-    logging.info(f"  No SASA computed: {n_no_sasa}")
+    logging.info(f"  With SASA (direct PDB): {n_with_sasa}")
+    logging.info(f"  No SASA (no direct PDB): {n_no_sasa}")
 
 
 if __name__ == "__main__":
