@@ -35,3 +35,5 @@ results/**/*.pkl
 *.swo
 .vscode/
 .idea/
+.specstory/
+.cursor/
