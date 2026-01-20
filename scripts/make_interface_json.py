@@ -48,7 +48,16 @@ def parse_args():
     p.add_argument("--output", default="data/processed/interfaces/interfaces.jsonl", help="Output JSONL")
     p.add_argument("--limit", type=int, default=None, help="Process first N rows of INPUT")
     p.add_argument("--log-every", type=int, default=2000)
+    p.add_argument("--pident-threshold", type=float, default=90.0,
+                   help="If pident >= threshold, use sifts_uniprot for mapping even when uniprot differs (default: 90.0)")
     return p.parse_args()
+
+
+# Candidate column names for sifts_uniprot and pident
+CANDIDATE_SIFTS_A = ["sifts_uniprot_a", "sifts_uniprot_a_x", "sifts_uniprot_a_y"]
+CANDIDATE_SIFTS_B = ["sifts_uniprot_b", "sifts_uniprot_b_x", "sifts_uniprot_b_y"]
+CANDIDATE_PIDENT_A = ["pident_a", "pident_a_x", "pident_a_y"]
+CANDIDATE_PIDENT_B = ["pident_b", "pident_b_x", "pident_b_y"]
 
 def extract_uniprot_ac(s: str) -> str:
     """Extract UniProt accession from formats like 'sp|P12345|NAME' or 'tr|A0A024QYR6|NAME' -> 'P12345' or 'A0A024QYR6'"""
@@ -253,6 +262,19 @@ def main():
     logging.info(f"Reading UniProt FASTA: {args.fasta}")
     up_seqs = load_uniprot_fasta(args.fasta)
 
+    # Resolve sifts_uniprot and pident column names
+    sifts_a_col = pick_first_present(CANDIDATE_SIFTS_A, df)
+    sifts_b_col = pick_first_present(CANDIDATE_SIFTS_B, df)
+    pident_a_col = pick_first_present(CANDIDATE_PIDENT_A, df)
+    pident_b_col = pick_first_present(CANDIDATE_PIDENT_B, df)
+
+    if sifts_a_col and pident_a_col:
+        logging.info(f"Using sifts columns: {sifts_a_col}, {sifts_b_col}")
+        logging.info(f"Using pident columns: {pident_a_col}, {pident_b_col}")
+        logging.info(f"pident threshold for fallback: {args.pident_threshold}%")
+    else:
+        logging.warning("sifts_uniprot or pident columns not found; fallback mapping disabled")
+
     # JSONL 出力
     out = Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -261,6 +283,8 @@ def main():
     n_written = 0
     n_missing_map = 0
     n_missing_seq = 0
+    n_exact_match = 0
+    n_sifts_fallback = 0
 
     with open(out, "w") as fw:
         for i, r in df.iterrows():
@@ -268,19 +292,54 @@ def main():
             pdb = str(r["pdb_id"]).lower()
             ca  = str(r["chain_id_a"]); cb  = str(r["chain_id_b"])
 
+            # Get sifts_uniprot and pident values
+            sifts_ua = str(r[sifts_a_col]) if sifts_a_col and pd.notna(r.get(sifts_a_col)) else None
+            sifts_ub = str(r[sifts_b_col]) if sifts_b_col and pd.notna(r.get(sifts_b_col)) else None
+            pident_a = float(r[pident_a_col]) if pident_a_col and pd.notna(r.get(pident_a_col)) else None
+            pident_b = float(r[pident_b_col]) if pident_b_col and pd.notna(r.get(pident_b_col)) else None
+
             # iface 残基
             ra = normalize_res_list(r[iface_a_col]) if iface_a_col in df.columns else []
             rb = normalize_res_list(r[iface_b_col]) if iface_b_col in df.columns else []
 
-            # SIFTS 区間
-            key_a = (pdb, ca, ua); key_b = (pdb, cb, ub)
+            # Determine which UniProt AC to use for SIFTS lookup (side A)
+            is_exact_a = (ua == sifts_ua) if sifts_ua else True
+            mapping_used_a = "none"
+            key_a = (pdb, ca, ua)
             ranges_a = sifts_idx.get(key_a, [])
+            if ranges_a:
+                mapping_used_a = "exact"
+                n_exact_match += 1
+            elif sifts_ua and pident_a is not None and pident_a >= args.pident_threshold:
+                # Fallback to sifts_uniprot
+                key_a_fallback = (pdb, ca, sifts_ua)
+                ranges_a = sifts_idx.get(key_a_fallback, [])
+                if ranges_a:
+                    mapping_used_a = "sifts_fallback"
+                    n_sifts_fallback += 1
+
+            # Determine which UniProt AC to use for SIFTS lookup (side B)
+            is_exact_b = (ub == sifts_ub) if sifts_ub else True
+            mapping_used_b = "none"
+            key_b = (pdb, cb, ub)
             ranges_b = sifts_idx.get(key_b, [])
+            if ranges_b:
+                mapping_used_b = "exact"
+            elif sifts_ub and pident_b is not None and pident_b >= args.pident_threshold:
+                # Fallback to sifts_uniprot
+                key_b_fallback = (pdb, cb, sifts_ub)
+                ranges_b = sifts_idx.get(key_b_fallback, [])
+                if ranges_b:
+                    mapping_used_b = "sifts_fallback"
+
             if not ranges_a or not ranges_b:
                 n_missing_map += 1
 
-            # UniProt 配列
-            seq_a = up_seqs.get(ua); seq_b = up_seqs.get(ub)
+            # UniProt 配列 - use sifts_uniprot for sequence lookup if fallback was used
+            seq_ac_a = sifts_ua if mapping_used_a == "sifts_fallback" and sifts_ua else ua
+            seq_ac_b = sifts_ub if mapping_used_b == "sifts_fallback" and sifts_ub else ub
+            seq_a = up_seqs.get(seq_ac_a)
+            seq_b = up_seqs.get(seq_ac_b)
             if seq_a is None or seq_b is None:
                 n_missing_seq += 1
 
@@ -312,6 +371,17 @@ def main():
                     "chain_id_b": cb,
                     "assembly_id": r.get("assembly_id") if "assembly_id" in df.columns else None
                 },
+                "mapping_info": {
+                    "sifts_uniprot_a": sifts_ua,
+                    "sifts_uniprot_b": sifts_ub,
+                    "pident_a": pident_a,
+                    "pident_b": pident_b,
+                    "is_exact_match_a": is_exact_a,
+                    "is_exact_match_b": is_exact_b,
+                    "mapping_used_a": mapping_used_a,
+                    "mapping_used_b": mapping_used_b,
+                    "pident_threshold": args.pident_threshold
+                },
                 "metrics": {
                     "bsa_total": float(r["bsa_total"]) if "bsa_total" in df.columns and pd.notna(r["bsa_total"]) else None,
                     "n_atom_contacts": int(r["n_atom_contacts"]) if "n_atom_contacts" in df.columns and pd.notna(r["n_atom_contacts"]) else None,
@@ -329,9 +399,10 @@ def main():
                     "params": {
                         "sifts_file": str(args.sifts),
                         "uniprot_fasta": str(args.fasta),
-                        "upstream": args.upstream
+                        "upstream": args.upstream,
+                        "pident_threshold": args.pident_threshold
                     },
-                    "version": "0.2.0"
+                    "version": "0.3.0"
                 }
             }
             fw.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -340,6 +411,8 @@ def main():
                 logging.info(f"processed {i+1}/{n_rows}")
 
     logging.info(f"written: {out} rows={n_written}")
+    logging.info(f"exact match mapping (side A): {n_exact_match}")
+    logging.info(f"sifts fallback mapping (side A, pident >= {args.pident_threshold}%): {n_sifts_fallback}")
     logging.info(f"missing SIFTS map (any-side): {n_missing_map}")
     logging.info(f"missing UniProt sequence (any-side): {n_missing_seq}")
 
