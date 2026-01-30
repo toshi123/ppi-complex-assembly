@@ -15,6 +15,10 @@ dependencies:
   - scikit-learn
   - pyyaml
 
+  # Data storage
+  - pyarrow
+  - duckdb
+
   # Bio / structure
   - gemmi
   - biopython

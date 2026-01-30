@@ -16,6 +16,7 @@ venv/
 data/raw/
 data/interim/
 data/processed/*.sqlite
+data/processed/*.parquet
 data/processed/*.h5
 data/processed/*.pkl
 data/processed/interfaces/*.json
