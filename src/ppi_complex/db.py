@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 
 try:
-    import duckdb
+    import duckdb  # type: ignore[import-untyped]
 except ImportError:
     raise ImportError("duckdb is required. Install with: pip install duckdb")
 
@@ -95,7 +95,7 @@ class HumanProteomeDB:
     
     # ========== タンパク質レベルのクエリ ==========
     
-    def get_protein(self, uniprot_id: str) -> Optional[Dict[str, Any]]:
+    def get_protein(self, uniprot_id: str, include_partners: bool = True) -> Optional[Dict[str, Any]]:
         """
         タンパク質情報を取得
         
@@ -103,6 +103,8 @@ class HumanProteomeDB:
         ----------
         uniprot_id : str
             UniProt アクセッション番号
+        include_partners : bool
+            PPIパートナー情報を含めるか（デフォルトTrue）
         
         Returns
         -------
@@ -117,7 +119,13 @@ class HumanProteomeDB:
             return None
         
         columns = [desc[0] for desc in self.conn.description]
-        return dict(zip(columns, result))
+        protein = dict(zip(columns, result))
+        
+        # PPIパートナーを追加
+        if include_partners:
+            protein["ppi_partners"] = self.get_ppi_partners(uniprot_id)
+        
+        return protein
     
     def get_protein_go(self, uniprot_id: str, category: str = None) -> List[Dict[str, str]]:
         """
@@ -345,6 +353,51 @@ class HumanProteomeDB:
             residues.append(row_dict)
         
         return residues
+    
+    def get_interfaces(self, uniprot_id: str) -> Dict[str, Dict[str, Any]]:
+        """
+        パートナーごとにグループ化したインターフェイス情報を取得
+        
+        Parameters
+        ----------
+        uniprot_id : str
+            UniProt アクセッション番号
+        
+        Returns
+        -------
+        dict
+            {
+                partner_id: {
+                    "residues": [position, ...],
+                    "n_residues": int
+                },
+                ...
+            }
+        """
+        result = self.conn.execute("""
+            SELECT position, interface_partners FROM residues 
+            WHERE uniprot_id = ? AND interface_partners != '[]'
+            ORDER BY position
+        """, [uniprot_id]).fetchall()
+        
+        # パートナーごとにグループ化
+        interfaces: Dict[str, List[int]] = {}
+        for row in result:
+            position = row[0]
+            partners = json.loads(row[1])
+            for partner in partners:
+                if partner not in interfaces:
+                    interfaces[partner] = []
+                interfaces[partner].append(position)
+        
+        # 結果を整形
+        return {
+            partner: {
+                "residues": positions,
+                "n_residues": len(positions)
+            }
+            for partner, positions in interfaces.items()
+        }
     
     def get_disordered_residues(self, uniprot_id: str) -> List[Dict[str, Any]]:
         """
