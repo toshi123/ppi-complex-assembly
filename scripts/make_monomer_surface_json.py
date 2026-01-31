@@ -36,6 +36,7 @@ from contextlib import contextmanager
 import pandas as pd
 import gemmi
 import freesasa
+import requests
 
 # -------------------- 定数 --------------------
 
@@ -168,12 +169,44 @@ def load_uniprot_fasta(fasta_path: str) -> dict:
     return seqs
 
 
-def find_structure_path(pdb_id: str, pdb_dir: Path) -> Path | None:
+def download_pdb_structure(pdb_id: str, pdb_dir: Path, timeout: int = 30) -> Path | None:
+    """
+    PDB構造をRCSBからダウンロードする。
+    .cif.gz 形式でダウンロードを試みる。
+    """
+    pdb_id = pdb_id.lower()
+    out_path = pdb_dir / f"{pdb_id}.cif.gz"
+    
+    if out_path.exists():
+        return out_path
+    
+    url = f"https://files.rcsb.org/download/{pdb_id.upper()}.cif.gz"
+    try:
+        r = requests.get(url, timeout=timeout)
+        r.raise_for_status()
+        with open(out_path, "wb") as f:
+            f.write(r.content)
+        logging.debug(f"Downloaded PDB structure: {pdb_id}")
+        return out_path
+    except Exception as e:
+        logging.debug(f"Failed to download {pdb_id}: {e}")
+        return None
+
+
+def find_structure_path(pdb_id: str, pdb_dir: Path, auto_download: bool = True) -> Path | None:
+    """
+    PDB構造ファイルを探す。存在しない場合はダウンロードを試みる。
+    """
     pdb_id = pdb_id.lower()
     for ext in (".bcif.gz", ".cif.gz", ".cif", ".bcif"):
         p = pdb_dir / f"{pdb_id}{ext}"
         if p.exists():
             return p
+    
+    # 見つからない場合はダウンロードを試みる
+    if auto_download:
+        return download_pdb_structure(pdb_id, pdb_dir)
+    
     return None
 
 # -------------------- SIFTS --------------------
