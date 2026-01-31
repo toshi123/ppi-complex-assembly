@@ -121,6 +121,12 @@ class HumanProteomeDB:
         columns = [desc[0] for desc in self.conn.description]
         protein = dict(zip(columns, result))
         
+        # surface_pdb_sources をパース
+        if "surface_pdb_sources" in protein and protein["surface_pdb_sources"]:
+            protein["surface_pdb_sources"] = json.loads(protein["surface_pdb_sources"])
+        else:
+            protein["surface_pdb_sources"] = []
+        
         # PPIパートナーを追加
         if include_partners:
             protein["ppi_partners"] = self.get_ppi_partners(uniprot_id)
@@ -368,12 +374,19 @@ class HumanProteomeDB:
         dict
             {
                 partner_id: {
+                    "pdb_id": str or None,
+                    "chains": [str, str] or [],
                     "residues": [position, ...],
-                    "n_residues": int
+                    "n_residues": int,
+                    "bsa_total": float or None,
+                    "n_atom_contacts": int or None,
+                    "min_atom_distance": float or None,
+                    "stats": dict or None
                 },
                 ...
             }
         """
+        # Parquetから残基レベルの情報を取得
         result = self.conn.execute("""
             SELECT position, interface_partners FROM residues 
             WHERE uniprot_id = ? AND interface_partners != '[]'
@@ -381,23 +394,61 @@ class HumanProteomeDB:
         """, [uniprot_id]).fetchall()
         
         # パートナーごとにグループ化
-        interfaces: Dict[str, List[int]] = {}
+        interfaces: Dict[str, Dict[str, Any]] = {}
         for row in result:
             position = row[0]
             partners = json.loads(row[1])
             for partner in partners:
                 if partner not in interfaces:
-                    interfaces[partner] = []
-                interfaces[partner].append(position)
+                    interfaces[partner] = {
+                        "pdb_id": None,
+                        "chains": [],
+                        "residues": [],
+                        "n_residues": 0,
+                        "bsa_total": None,
+                        "n_atom_contacts": None,
+                        "min_atom_distance": None,
+                        "stats": None
+                    }
+                interfaces[partner]["residues"].append(position)
         
-        # 結果を整形
-        return {
-            partner: {
-                "residues": positions,
-                "n_residues": len(positions)
-            }
-            for partner, positions in interfaces.items()
-        }
+        # 残基数を計算
+        for partner in interfaces:
+            interfaces[partner]["n_residues"] = len(interfaces[partner]["residues"])
+        
+        # SQLiteからパートナーごとの詳細情報を取得
+        detail_result = self.conn.execute("""
+            SELECT partner_id, pdb_id, chains, residues, n_residues,
+                   bsa_total, n_atom_contacts, min_atom_distance, stats
+            FROM meta.ppi_interfaces 
+            WHERE uniprot_id = ?
+        """, [uniprot_id]).fetchall()
+        
+        # 詳細情報をマージ
+        for row in detail_result:
+            partner_id = row[0]
+            if partner_id in interfaces:
+                interfaces[partner_id]["pdb_id"] = row[1]
+                interfaces[partner_id]["chains"] = json.loads(row[2]) if row[2] else []
+                # residues は Parquet から取得したものを優先（より正確）
+                interfaces[partner_id]["bsa_total"] = row[5]
+                interfaces[partner_id]["n_atom_contacts"] = row[6]
+                interfaces[partner_id]["min_atom_distance"] = row[7]
+                interfaces[partner_id]["stats"] = json.loads(row[8]) if row[8] else None
+            else:
+                # Parquetにないがメタデータにある場合
+                interfaces[partner_id] = {
+                    "pdb_id": row[1],
+                    "chains": json.loads(row[2]) if row[2] else [],
+                    "residues": json.loads(row[3]) if row[3] else [],
+                    "n_residues": row[4] or 0,
+                    "bsa_total": row[5],
+                    "n_atom_contacts": row[6],
+                    "min_atom_distance": row[7],
+                    "stats": json.loads(row[8]) if row[8] else None
+                }
+        
+        return interfaces
     
     def get_disordered_residues(self, uniprot_id: str) -> List[Dict[str, Any]]:
         """

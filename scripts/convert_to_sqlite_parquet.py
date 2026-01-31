@@ -93,7 +93,8 @@ def create_sqlite_schema(conn: sqlite3.Connection):
             n_buried INTEGER,
             n_unknown INTEGER,
             n_disorder INTEGER,
-            n_interface INTEGER
+            n_interface INTEGER,
+            surface_pdb_sources TEXT
         )
     """)
     
@@ -147,6 +148,36 @@ def create_sqlite_schema(conn: sqlite3.Connection):
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_ppi_partners_partner 
         ON ppi_partners(partner_id)
+    """)
+    
+    # PPIインターフェイス詳細（パートナーごと）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ppi_interfaces (
+            uniprot_id TEXT,
+            partner_id TEXT,
+            pdb_id TEXT,
+            chains TEXT,
+            residues TEXT,
+            n_residues INTEGER,
+            bsa_total REAL,
+            n_atom_contacts INTEGER,
+            min_atom_distance REAL,
+            stats TEXT,
+            FOREIGN KEY (uniprot_id) REFERENCES proteins(uniprot_id),
+            PRIMARY KEY (uniprot_id, partner_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ppi_interfaces_uniprot 
+        ON ppi_interfaces(uniprot_id)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ppi_interfaces_partner 
+        ON ppi_interfaces(partner_id)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ppi_interfaces_pdb 
+        ON ppi_interfaces(pdb_id)
     """)
     
     conn.commit()
@@ -278,6 +309,7 @@ def main():
     go_batch = []
     loc_batch = []
     ppi_batch = []
+    ppi_iface_batch = []
     
     with open_file(args.annotations) as f:
         for line in f:
@@ -291,6 +323,8 @@ def main():
             length = rec.get("length", len(sequence))
             residues = rec.get("residues", {})
             summary = rec.get("summary", {})
+            surface_pdb_sources = rec.get("surface_pdb_sources", [])
+            ppi_interfaces = rec.get("ppi_interfaces", {})
             
             processed_acs.add(uniprot_id)
             
@@ -299,8 +333,9 @@ def main():
             cursor.execute("""
                 INSERT OR REPLACE INTO proteins 
                 (uniprot_id, sequence, length, description, 
-                 n_surface, n_buried, n_unknown, n_disorder, n_interface)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 n_surface, n_buried, n_unknown, n_disorder, n_interface,
+                 surface_pdb_sources)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 uniprot_id,
                 sequence,
@@ -310,7 +345,8 @@ def main():
                 summary.get("n_buried", 0),
                 summary.get("n_unknown", 0),
                 summary.get("n_disorder", 0),
-                summary.get("n_interface", 0)
+                summary.get("n_interface", 0),
+                json.dumps(surface_pdb_sources) if surface_pdb_sources else "[]"
             ))
             
             # GO terms
@@ -328,6 +364,21 @@ def main():
             # PPI partners
             for partner in summary.get("ppi_partners", []):
                 ppi_batch.append((uniprot_id, partner))
+            
+            # PPI interfaces（パートナーごとの詳細）
+            for partner_id, iface_info in ppi_interfaces.items():
+                ppi_iface_batch.append((
+                    uniprot_id,
+                    partner_id,
+                    iface_info.get("pdb_id"),
+                    json.dumps(iface_info.get("chains", [])),
+                    json.dumps(iface_info.get("residues", [])),
+                    iface_info.get("n_residues", 0),
+                    iface_info.get("bsa_total"),
+                    iface_info.get("n_atom_contacts"),
+                    iface_info.get("min_atom_distance"),
+                    json.dumps(iface_info.get("stats")) if iface_info.get("stats") else None
+                ))
             
             # 残基データをParquetに追加
             residue_rows = []
@@ -372,6 +423,14 @@ def main():
                         ppi_batch
                     )
                     ppi_batch = []
+                if ppi_iface_batch:
+                    cursor.executemany("""
+                        INSERT OR REPLACE INTO ppi_interfaces 
+                        (uniprot_id, partner_id, pdb_id, chains, residues, n_residues,
+                         bsa_total, n_atom_contacts, min_atom_distance, stats)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, ppi_iface_batch)
+                    ppi_iface_batch = []
                 conn.commit()
             
             if n_proteins % args.log_every == 0:
@@ -393,6 +452,13 @@ def main():
             "INSERT INTO ppi_partners (uniprot_id, partner_id) VALUES (?, ?)",
             ppi_batch
         )
+    if ppi_iface_batch:
+        cursor.executemany("""
+            INSERT OR REPLACE INTO ppi_interfaces 
+            (uniprot_id, partner_id, pdb_id, chains, residues, n_residues,
+             bsa_total, n_atom_contacts, min_atom_distance, stats)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, ppi_iface_batch)
     
     # ac2seq にあるが residue_annotations にないタンパク質を追加
     # （残基データはないが、メタデータとして保持）

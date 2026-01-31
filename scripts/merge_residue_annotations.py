@@ -33,6 +33,20 @@ merge_residue_annotations.py
     "n_disorder": 50,
     "n_interface": 30,
     "ppi_partners": ["Q67890", "P11111"]
+  },
+  "surface_pdb_sources": ["6wjd_E", "7w37_E"],  // モノマー構造PDB
+  "ppi_interfaces": {
+    "Q67890": {
+      "pdb_id": "3i7u",
+      "chains": ["B", "C"],
+      "residues": [45, 46, 50, ...],
+      "n_residues": 15,
+      "bsa_total": 1663.4,
+      "n_atom_contacts": 86,
+      "min_atom_distance": 2.63,
+      "stats": {"hydrophobic_frac": 0.35, ...}
+    },
+    ...
   }
 }
 
@@ -138,16 +152,24 @@ def build_disorder_positions(disorder_regions: set) -> set:
     return positions
 
 
-def load_interfaces(interfaces_path: str) -> dict:
+def load_interfaces(interfaces_path: str) -> tuple:
     """
-    インターフェースJSONLを読み込み、UniProt ID → インターフェース情報のマッピングを返す
+    インターフェースJSONLを読み込み、2つのマッピングを返す
     
     Returns:
-        dict: {uniprot_id: {position: [partner_uniprot_ids]}}
+        tuple: (
+            interface_map: {uniprot_id: {position: set(partner_uniprot_ids)}},
+            interface_details: {uniprot_id: {partner_id: {pdb_id, chains, residues, metrics, stats}}}
+        )
     """
     logging.info(f"Loading interfaces: {interfaces_path}")
     
+    # 残基レベルのマッピング
     interface_map = defaultdict(lambda: defaultdict(set))
+    
+    # パートナーごとの詳細情報
+    # {uniprot_id: {partner_id: {"pdb_id": ..., "chains": [...], "residues": [...], ...}}}
+    interface_details = defaultdict(dict)
     
     def _open(path):
         if str(path).endswith(".gz"):
@@ -166,20 +188,73 @@ def load_interfaces(interfaces_path: str) -> dict:
             ua = rec["uniprot"]["a"]
             ub = rec["uniprot"]["b"]
             
-            # Side A の残基
-            for res in rec["interface"].get("residues_a", []):
-                sp_pos = res.get("uniprot_pos")
-                if sp_pos:
-                    interface_map[ua][sp_pos].add(ub)
+            # PDB情報
+            source = rec.get("source", {})
+            pdb_id = source.get("pdb_id")
+            chain_a = source.get("chain_id_a")
+            chain_b = source.get("chain_id_b")
             
-            # Side B の残基
-            for res in rec["interface"].get("residues_b", []):
-                sp_pos = res.get("uniprot_pos")
-                if sp_pos:
-                    interface_map[ub][sp_pos].add(ua)
+            # メトリクス
+            metrics = rec.get("metrics", {})
+            bsa_total = metrics.get("bsa_total")
+            n_atom_contacts = metrics.get("n_atom_contacts")
+            min_atom_distance = metrics.get("min_atom_distance")
+            
+            # インターフェイス残基
+            iface = rec.get("interface", {})
+            residues_a = [r.get("uniprot_pos") for r in iface.get("residues_a", []) if r.get("uniprot_pos")]
+            residues_b = [r.get("uniprot_pos") for r in iface.get("residues_b", []) if r.get("uniprot_pos")]
+            stats_a = iface.get("stats_a", {})
+            stats_b = iface.get("stats_b", {})
+            
+            # Side A の残基マッピング
+            for sp_pos in residues_a:
+                interface_map[ua][sp_pos].add(ub)
+            
+            # Side B の残基マッピング
+            for sp_pos in residues_b:
+                interface_map[ub][sp_pos].add(ua)
+            
+            # パートナーごとの詳細情報（A側）
+            if residues_a and ub not in interface_details[ua]:
+                interface_details[ua][ub] = {
+                    "pdb_id": pdb_id,
+                    "chains": [chain_a, chain_b] if chain_a and chain_b else [],
+                    "residues": sorted(residues_a),
+                    "n_residues": len(residues_a),
+                    "bsa_total": round(bsa_total, 2) if bsa_total else None,
+                    "n_atom_contacts": n_atom_contacts,
+                    "min_atom_distance": round(min_atom_distance, 3) if min_atom_distance else None,
+                    "stats": stats_a if any(v for v in stats_a.values()) else None
+                }
+            elif residues_a and ub in interface_details[ua]:
+                # 複数のPDB構造がある場合、残基をマージ
+                existing = interface_details[ua][ub]
+                merged_residues = sorted(set(existing["residues"]) | set(residues_a))
+                existing["residues"] = merged_residues
+                existing["n_residues"] = len(merged_residues)
+            
+            # パートナーごとの詳細情報（B側）
+            if residues_b and ua not in interface_details[ub]:
+                interface_details[ub][ua] = {
+                    "pdb_id": pdb_id,
+                    "chains": [chain_b, chain_a] if chain_a and chain_b else [],
+                    "residues": sorted(residues_b),
+                    "n_residues": len(residues_b),
+                    "bsa_total": round(bsa_total, 2) if bsa_total else None,
+                    "n_atom_contacts": n_atom_contacts,
+                    "min_atom_distance": round(min_atom_distance, 3) if min_atom_distance else None,
+                    "stats": stats_b if any(v for v in stats_b.values()) else None
+                }
+            elif residues_b and ua in interface_details[ub]:
+                # 複数のPDB構造がある場合、残基をマージ
+                existing = interface_details[ub][ua]
+                merged_residues = sorted(set(existing["residues"]) | set(residues_b))
+                existing["residues"] = merged_residues
+                existing["n_residues"] = len(merged_residues)
     
     logging.info(f"Interfaces: loaded {n_entries} entries, {len(interface_map)} unique proteins")
-    return dict(interface_map)
+    return dict(interface_map), dict(interface_details)
 
 
 def main():
@@ -189,8 +264,8 @@ def main():
     # 1. IDEALからディスオーダー情報を読み込み
     disorder_map = parse_ideal_xml(args.ideal, human_only=args.human_only)
     
-    # 2. インターフェース情報を読み込み
-    interface_map = load_interfaces(args.interfaces)
+    # 2. インターフェース情報を読み込み（残基マッピング + パートナー詳細）
+    interface_map, interface_details = load_interfaces(args.interfaces)
     
     # 3. Surface JSONLを読み込みながら、統合して出力
     logging.info(f"Processing surface JSONL: {args.surface}")
@@ -218,6 +293,9 @@ def main():
             sequence = rec.get("sequence", "")
             length = rec.get("length", len(sequence))
             residue_labels = rec.get("residue_labels", {})
+            
+            # Surface計算に使用したPDB構造
+            surface_pdb_sources = rec.get("pdb_sources", [])
             
             # ディスオーダー位置を取得
             disorder_regions = disorder_map.get(uniprot_id, set())
@@ -278,6 +356,9 @@ def main():
                 if partners:
                     n_interface_res += 1
             
+            # パートナーごとのインターフェイス詳細
+            ppi_interfaces = interface_details.get(uniprot_id, {})
+            
             # 出力レコード
             out_rec = {
                 "uniprot_id": uniprot_id,
@@ -291,7 +372,9 @@ def main():
                     "n_disorder": n_disorder_res,
                     "n_interface": n_interface_res,
                     "ppi_partners": sorted(all_partners)
-                }
+                },
+                "surface_pdb_sources": surface_pdb_sources,
+                "ppi_interfaces": ppi_interfaces
             }
             
             fout.write(json.dumps(out_rec, ensure_ascii=False) + "\n")
