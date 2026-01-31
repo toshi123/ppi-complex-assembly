@@ -702,6 +702,102 @@ class HumanProteomeDB:
             ]
         }
     
+    # ========== 遺伝子名・RefSeq検索 ==========
+    
+    def search_by_gene(self, gene_name: str) -> List[Dict[str, Any]]:
+        """
+        遺伝子名でタンパク質を検索
+        
+        Parameters
+        ----------
+        gene_name : str
+            遺伝子名（大文字小文字を区別しない）
+        
+        Returns
+        -------
+        list of dict
+            [{"uniprot_id": "Q96CU9", "gene_name": "FOXRED1", "name_type": "primary"}, ...]
+        """
+        rows = self.conn.execute("""
+            SELECT uniprot_id, gene_name, name_type
+            FROM meta.uniprot_gene_names
+            WHERE UPPER(gene_name) = UPPER(?)
+        """, [gene_name]).fetchall()
+        
+        return [
+            {"uniprot_id": r[0], "gene_name": r[1], "name_type": r[2]}
+            for r in rows
+        ]
+    
+    def get_gene_names(self, uniprot_id: str) -> List[Dict[str, str]]:
+        """
+        タンパク質の遺伝子名を取得
+        
+        Parameters
+        ----------
+        uniprot_id : str
+            UniProt アクセッション番号
+        
+        Returns
+        -------
+        list of dict
+            [{"gene_name": "FOXRED1", "name_type": "primary"}, ...]
+        """
+        rows = self.conn.execute("""
+            SELECT gene_name, name_type
+            FROM meta.uniprot_gene_names
+            WHERE uniprot_id = ?
+        """, [uniprot_id]).fetchall()
+        
+        return [{"gene_name": r[0], "name_type": r[1]} for r in rows]
+    
+    def search_by_refseq(self, refseq_id: str) -> List[Dict[str, Any]]:
+        """
+        RefSeq IDでタンパク質を検索（NP_*, XP_*, NM_*, XM_*）
+        
+        Parameters
+        ----------
+        refseq_id : str
+            RefSeq ID
+        
+        Returns
+        -------
+        list of dict
+            [{"uniprot_id": "Q96CU9", "protein_id": "NP_*", "nucleotide_id": "NM_*"}, ...]
+        """
+        rows = self.conn.execute("""
+            SELECT uniprot_id, protein_id, nucleotide_id
+            FROM meta.uniprot_refseq
+            WHERE protein_id = ? OR nucleotide_id = ?
+        """, [refseq_id, refseq_id]).fetchall()
+        
+        return [
+            {"uniprot_id": r[0], "protein_id": r[1], "nucleotide_id": r[2]}
+            for r in rows
+        ]
+    
+    def get_refseq_ids(self, uniprot_id: str) -> List[Dict[str, str]]:
+        """
+        タンパク質のRefSeq IDを取得
+        
+        Parameters
+        ----------
+        uniprot_id : str
+            UniProt アクセッション番号
+        
+        Returns
+        -------
+        list of dict
+            [{"protein_id": "NP_*", "nucleotide_id": "NM_*"}, ...]
+        """
+        rows = self.conn.execute("""
+            SELECT protein_id, nucleotide_id
+            FROM meta.uniprot_refseq
+            WHERE uniprot_id = ?
+        """, [uniprot_id]).fetchall()
+        
+        return [{"protein_id": r[0], "nucleotide_id": r[1]} for r in rows]
+    
     # ========== 汎用クエリ ==========
     
     def query(self, sql: str, params: list = None) -> Union["pd.DataFrame", List[tuple]]:

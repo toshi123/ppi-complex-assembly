@@ -262,6 +262,46 @@ def create_sqlite_schema(conn: sqlite3.Connection):
         )
     """)
     
+    # 遺伝子名
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uniprot_gene_names (
+            uniprot_id TEXT,
+            gene_name TEXT,
+            name_type TEXT,
+            FOREIGN KEY (uniprot_id) REFERENCES proteins(uniprot_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_gene_names_uniprot 
+        ON uniprot_gene_names(uniprot_id)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_gene_names_name 
+        ON uniprot_gene_names(gene_name)
+    """)
+    
+    # RefSeq IDs
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uniprot_refseq (
+            uniprot_id TEXT,
+            protein_id TEXT,
+            nucleotide_id TEXT,
+            FOREIGN KEY (uniprot_id) REFERENCES proteins(uniprot_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_refseq_uniprot 
+        ON uniprot_refseq(uniprot_id)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_refseq_protein 
+        ON uniprot_refseq(protein_id)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_refseq_nucleotide 
+        ON uniprot_refseq(nucleotide_id)
+    """)
+    
     conn.commit()
 
 
@@ -592,6 +632,8 @@ def main():
         region_batch = []
         subloc_batch = []
         expression_batch = []
+        gene_name_batch = []
+        refseq_batch = []
         
         with open_file(args.uniprot_features) as f:
             for line in f:
@@ -763,6 +805,22 @@ def main():
                         expr.get("full_description", "")
                     ))
                 
+                # 遺伝子名
+                for gn in rec.get("gene_names", []):
+                    gene_name_batch.append((
+                        uniprot_id,
+                        gn.get("name"),
+                        gn.get("type")
+                    ))
+                
+                # RefSeq IDs
+                for rs in rec.get("refseq_ids", []):
+                    refseq_batch.append((
+                        uniprot_id,
+                        rs.get("protein_id"),
+                        rs.get("nucleotide_id")
+                    ))
+                
                 n_uniprot += 1
                 
                 # バッチ挿入
@@ -802,6 +860,20 @@ def main():
                             VALUES (?, ?, ?)
                         """, expression_batch)
                         expression_batch = []
+                    if gene_name_batch:
+                        cursor.executemany("""
+                            INSERT INTO uniprot_gene_names 
+                            (uniprot_id, gene_name, name_type)
+                            VALUES (?, ?, ?)
+                        """, gene_name_batch)
+                        gene_name_batch = []
+                    if refseq_batch:
+                        cursor.executemany("""
+                            INSERT INTO uniprot_refseq 
+                            (uniprot_id, protein_id, nucleotide_id)
+                            VALUES (?, ?, ?)
+                        """, refseq_batch)
+                        refseq_batch = []
                     conn.commit()
                     logging.info(f"  Processed {n_uniprot} UniProt entries...")
         
@@ -836,6 +908,18 @@ def main():
                 (uniprot_id, primary_tissue, full_description)
                 VALUES (?, ?, ?)
             """, expression_batch)
+        if gene_name_batch:
+            cursor.executemany("""
+                INSERT INTO uniprot_gene_names 
+                (uniprot_id, gene_name, name_type)
+                VALUES (?, ?, ?)
+            """, gene_name_batch)
+        if refseq_batch:
+            cursor.executemany("""
+                INSERT INTO uniprot_refseq 
+                (uniprot_id, protein_id, nucleotide_id)
+                VALUES (?, ?, ?)
+            """, refseq_batch)
         
         conn.commit()
         logging.info(f"  Loaded {n_uniprot} UniProt feature entries")

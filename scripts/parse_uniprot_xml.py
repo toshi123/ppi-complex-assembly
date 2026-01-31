@@ -291,6 +291,19 @@ def parse_entry(entry):
             "type": gene.get("type")
         })
     
+    # RefSeq IDs
+    refseq_ids = []
+    for dbref in entry.findall("up:dbReference[@type='RefSeq']", NS):
+        protein_id = dbref.get("id")  # NP_*, XP_*
+        nucleotide_id = None
+        for prop in dbref.findall("up:property[@type='nucleotide sequence ID']", NS):
+            nucleotide_id = prop.get("value")  # NM_*, XM_*
+        if protein_id:
+            refseq_ids.append({
+                "protein_id": protein_id,
+                "nucleotide_id": nucleotide_id
+            })
+    
     # 特徴情報
     features = parse_features(entry)
     
@@ -304,6 +317,7 @@ def parse_entry(entry):
         "uniprot_id": primary_ac,
         "accessions": accessions,
         "gene_names": gene_names,
+        "refseq_ids": refseq_ids,
         **features,
         "subcellular_locations": subcellular_locations,
         "tissue_expression": tissue_expression
