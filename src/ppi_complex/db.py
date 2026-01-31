@@ -499,6 +499,209 @@ class HumanProteomeDB:
         
         return residues
     
+    # ========== UniProt Features ==========
+    
+    def get_uniprot_residue_features(
+        self, 
+        uniprot_id: str, 
+        feature_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        UniProt残基レベル特徴を取得（活性部位、PTM、結合部位）
+        
+        Parameters
+        ----------
+        uniprot_id : str
+            UniProt アクセッション番号
+        feature_type : str, optional
+            特徴タイプでフィルタ ('active_site', 'ptm', 'binding_site')
+        
+        Returns
+        -------
+        list of dict
+            [{"position": 123, "feature_type": "active_site", "description": "..."}, ...]
+        """
+        if feature_type:
+            rows = self.conn.execute("""
+                SELECT position, feature_type, description
+                FROM meta.uniprot_residue_features
+                WHERE uniprot_id = ? AND feature_type = ?
+                ORDER BY position
+            """, [uniprot_id, feature_type]).fetchall()
+        else:
+            rows = self.conn.execute("""
+                SELECT position, feature_type, description
+                FROM meta.uniprot_residue_features
+                WHERE uniprot_id = ?
+                ORDER BY position
+            """, [uniprot_id]).fetchall()
+        
+        return [
+            {"position": r[0], "feature_type": r[1], "description": r[2]}
+            for r in rows
+        ]
+    
+    def get_uniprot_disulfide_bonds(self, uniprot_id: str) -> List[Dict[str, Any]]:
+        """
+        ジスルフィド結合を取得
+        
+        Parameters
+        ----------
+        uniprot_id : str
+            UniProt アクセッション番号
+        
+        Returns
+        -------
+        list of dict
+            [{"position1": 47, "position2": 60, "note": ""}, ...]
+        """
+        rows = self.conn.execute("""
+            SELECT position1, position2, note
+            FROM meta.uniprot_disulfide_bonds
+            WHERE uniprot_id = ?
+            ORDER BY position1
+        """, [uniprot_id]).fetchall()
+        
+        return [
+            {"position1": r[0], "position2": r[1], "note": r[2]}
+            for r in rows
+        ]
+    
+    def get_uniprot_regions(
+        self, 
+        uniprot_id: str, 
+        region_type: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        UniProt領域特徴を取得
+        
+        Parameters
+        ----------
+        uniprot_id : str
+            UniProt アクセッション番号
+        region_type : str, optional
+            領域タイプでフィルタ:
+            'signal_peptide', 'transmembrane', 'topological_domain',
+            'dna_binding', 'coiled_coil', 'motif', 'domain', 'binding_region'
+        
+        Returns
+        -------
+        list of dict
+            [{"region_type": "transmembrane", "start": 99, "end": 124, 
+              "description": "Helical", "side": None}, ...]
+        """
+        if region_type:
+            rows = self.conn.execute("""
+                SELECT region_type, start_pos, end_pos, description, side
+                FROM meta.uniprot_regions
+                WHERE uniprot_id = ? AND region_type = ?
+                ORDER BY start_pos
+            """, [uniprot_id, region_type]).fetchall()
+        else:
+            rows = self.conn.execute("""
+                SELECT region_type, start_pos, end_pos, description, side
+                FROM meta.uniprot_regions
+                WHERE uniprot_id = ?
+                ORDER BY start_pos
+            """, [uniprot_id]).fetchall()
+        
+        return [
+            {
+                "region_type": r[0],
+                "start": r[1],
+                "end": r[2],
+                "description": r[3],
+                "side": r[4]
+            }
+            for r in rows
+        ]
+    
+    def get_uniprot_expression(self, uniprot_id: str) -> Optional[Dict[str, str]]:
+        """
+        組織発現パターンを取得（Bgeeより）
+        
+        Parameters
+        ----------
+        uniprot_id : str
+            UniProt アクセッション番号
+        
+        Returns
+        -------
+        dict or None
+            {"primary_tissue": "gastrocnemius", 
+             "full_description": "Expressed in gastrocnemius and 214 other cell types or tissues"}
+        """
+        row = self.conn.execute("""
+            SELECT primary_tissue, full_description
+            FROM meta.uniprot_expression
+            WHERE uniprot_id = ?
+        """, [uniprot_id]).fetchone()
+        
+        if row:
+            return {"primary_tissue": row[0], "full_description": row[1]}
+        return None
+    
+    def get_uniprot_subcellular_locations(self, uniprot_id: str) -> List[str]:
+        """
+        UniProtの詳細な細胞内局在を取得
+        
+        Parameters
+        ----------
+        uniprot_id : str
+            UniProt アクセッション番号
+        
+        Returns
+        -------
+        list of str
+            ["Cytoplasm > Cell cortex", "Nucleus", ...]
+        """
+        rows = self.conn.execute("""
+            SELECT location_chain
+            FROM meta.uniprot_subcellular_locations
+            WHERE uniprot_id = ?
+        """, [uniprot_id]).fetchall()
+        
+        return [r[0] for r in rows]
+    
+    def get_transmembrane_topology(self, uniprot_id: str) -> Dict[str, Any]:
+        """
+        膜貫通トポロジーを取得（膜貫通領域とIN/OUT情報）
+        
+        Parameters
+        ----------
+        uniprot_id : str
+            UniProt アクセッション番号
+        
+        Returns
+        -------
+        dict
+            {
+                "transmembrane": [{"start": 99, "end": 124, "description": "Helical"}],
+                "topology": [
+                    {"start": 24, "end": 98, "side": "OUT", "description": "Extracellular"},
+                    {"start": 125, "end": 160, "side": "IN", "description": "Cytoplasmic"}
+                ]
+            }
+        """
+        tm_regions = self.get_uniprot_regions(uniprot_id, "transmembrane")
+        topo_regions = self.get_uniprot_regions(uniprot_id, "topological_domain")
+        
+        return {
+            "transmembrane": [
+                {"start": r["start"], "end": r["end"], "description": r["description"]}
+                for r in tm_regions
+            ],
+            "topology": [
+                {
+                    "start": r["start"], 
+                    "end": r["end"], 
+                    "side": r["side"],
+                    "description": r["description"]
+                }
+                for r in topo_regions
+            ]
+        }
+    
     # ========== 汎用クエリ ==========
     
     def query(self, sql: str, params: list = None) -> Union["pd.DataFrame", List[tuple]]:

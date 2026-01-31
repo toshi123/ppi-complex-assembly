@@ -52,6 +52,8 @@ def parse_args():
                    help="ac2seq.json (sequences, for proteins not in annotations)")
     p.add_argument("--ac2loc", required=True,
                    help="ac2subcellularlocations_up_classified4.json")
+    p.add_argument("--uniprot-features",
+                   help="uniprot_features.jsonl (optional, from parse_uniprot_xml.py)")
     p.add_argument("--out-sqlite", default="data/processed/human_proteome.sqlite",
                    help="Output SQLite database")
     p.add_argument("--out-parquet", default="data/processed/human_residues.parquet",
@@ -178,6 +180,86 @@ def create_sqlite_schema(conn: sqlite3.Connection):
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_ppi_interfaces_pdb 
         ON ppi_interfaces(pdb_id)
+    """)
+    
+    # === UniProt features テーブル ===
+    
+    # 残基レベル特徴（活性部位、PTM、結合部位）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uniprot_residue_features (
+            uniprot_id TEXT,
+            position INTEGER,
+            feature_type TEXT,
+            description TEXT,
+            FOREIGN KEY (uniprot_id) REFERENCES proteins(uniprot_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_residue_features_uniprot 
+        ON uniprot_residue_features(uniprot_id)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_residue_features_type 
+        ON uniprot_residue_features(feature_type)
+    """)
+    
+    # ジスルフィド結合（2残基のペア）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uniprot_disulfide_bonds (
+            uniprot_id TEXT,
+            position1 INTEGER,
+            position2 INTEGER,
+            note TEXT,
+            FOREIGN KEY (uniprot_id) REFERENCES proteins(uniprot_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_disulfide_bonds_uniprot 
+        ON uniprot_disulfide_bonds(uniprot_id)
+    """)
+    
+    # 領域レベル特徴（シグナルペプチド、膜貫通、ドメインなど）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uniprot_regions (
+            uniprot_id TEXT,
+            region_type TEXT,
+            start_pos INTEGER,
+            end_pos INTEGER,
+            description TEXT,
+            side TEXT,
+            FOREIGN KEY (uniprot_id) REFERENCES proteins(uniprot_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_regions_uniprot 
+        ON uniprot_regions(uniprot_id)
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_regions_type 
+        ON uniprot_regions(region_type)
+    """)
+    
+    # 詳細な細胞内局在（UniProtから）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uniprot_subcellular_locations (
+            uniprot_id TEXT,
+            location_chain TEXT,
+            FOREIGN KEY (uniprot_id) REFERENCES proteins(uniprot_id)
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_uniprot_subcellular_locations_uniprot 
+        ON uniprot_subcellular_locations(uniprot_id)
+    """)
+    
+    # 組織発現パターン
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS uniprot_expression (
+            uniprot_id TEXT PRIMARY KEY,
+            primary_tissue TEXT,
+            full_description TEXT,
+            FOREIGN KEY (uniprot_id) REFERENCES proteins(uniprot_id)
+        )
     """)
     
     conn.commit()
@@ -499,6 +581,253 @@ def main():
     
     conn.commit()
     logging.info(f"  Added {n_added} proteins from ac2seq")
+    
+    # UniProt features の読み込みと挿入
+    if args.uniprot_features:
+        logging.info(f"Loading UniProt features: {args.uniprot_features}")
+        n_uniprot = 0
+        
+        residue_feature_batch = []
+        disulfide_batch = []
+        region_batch = []
+        subloc_batch = []
+        expression_batch = []
+        
+        with open_file(args.uniprot_features) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                rec = json.loads(line)
+                uniprot_id = rec["uniprot_id"]
+                
+                # 残基レベル特徴
+                residue_features = rec.get("residue_features", {})
+                
+                # Active sites
+                for feat in residue_features.get("active_sites", []):
+                    residue_feature_batch.append((
+                        uniprot_id,
+                        feat.get("position"),
+                        "active_site",
+                        feat.get("description", "")
+                    ))
+                
+                # Modified residues (PTM)
+                for feat in residue_features.get("modified_residues", []):
+                    residue_feature_batch.append((
+                        uniprot_id,
+                        feat.get("position"),
+                        "ptm",
+                        feat.get("modification", "")
+                    ))
+                
+                # Binding sites
+                for feat in residue_features.get("binding_sites", []):
+                    pos = feat.get("position")
+                    if pos:
+                        residue_feature_batch.append((
+                            uniprot_id,
+                            pos,
+                            "binding_site",
+                            feat.get("ligand", "")
+                        ))
+                    else:
+                        # 領域として扱う場合
+                        start = feat.get("start")
+                        end = feat.get("end")
+                        if start and end:
+                            region_batch.append((
+                                uniprot_id,
+                                "binding_region",
+                                start,
+                                end,
+                                feat.get("ligand", ""),
+                                None
+                            ))
+                
+                # Disulfide bonds
+                for feat in residue_features.get("disulfide_bonds", []):
+                    disulfide_batch.append((
+                        uniprot_id,
+                        feat.get("position1"),
+                        feat.get("position2"),
+                        feat.get("note", "")
+                    ))
+                
+                # 領域レベル特徴
+                region_features = rec.get("region_features", {})
+                
+                # Signal peptides
+                for feat in region_features.get("signal_peptides", []):
+                    region_batch.append((
+                        uniprot_id,
+                        "signal_peptide",
+                        feat.get("start"),
+                        feat.get("end"),
+                        "",
+                        None
+                    ))
+                
+                # Transmembrane
+                for feat in region_features.get("transmembrane", []):
+                    region_batch.append((
+                        uniprot_id,
+                        "transmembrane",
+                        feat.get("start"),
+                        feat.get("end"),
+                        feat.get("description", ""),
+                        None
+                    ))
+                
+                # Topological domains (IN/OUT)
+                for feat in region_features.get("topological_domains", []):
+                    region_batch.append((
+                        uniprot_id,
+                        "topological_domain",
+                        feat.get("start"),
+                        feat.get("end"),
+                        feat.get("description", ""),
+                        feat.get("side")
+                    ))
+                
+                # DNA/RNA binding
+                for feat in region_features.get("dna_binding", []):
+                    region_batch.append((
+                        uniprot_id,
+                        "dna_binding",
+                        feat.get("start"),
+                        feat.get("end"),
+                        feat.get("description", ""),
+                        None
+                    ))
+                
+                # Coiled-coils
+                for feat in region_features.get("coiled_coils", []):
+                    region_batch.append((
+                        uniprot_id,
+                        "coiled_coil",
+                        feat.get("start"),
+                        feat.get("end"),
+                        "",
+                        None
+                    ))
+                
+                # Motifs
+                for feat in region_features.get("motifs", []):
+                    region_batch.append((
+                        uniprot_id,
+                        "motif",
+                        feat.get("start"),
+                        feat.get("end"),
+                        feat.get("description", ""),
+                        None
+                    ))
+                
+                # Domains
+                for feat in region_features.get("domains", []):
+                    region_batch.append((
+                        uniprot_id,
+                        "domain",
+                        feat.get("start"),
+                        feat.get("end"),
+                        feat.get("name", ""),
+                        None
+                    ))
+                
+                # 細胞内局在
+                for loc_chain in rec.get("subcellular_locations", []):
+                    subloc_batch.append((
+                        uniprot_id,
+                        " > ".join(loc_chain)  # ["Cytoplasm", "Cell cortex"] → "Cytoplasm > Cell cortex"
+                    ))
+                
+                # 発現パターン
+                expr = rec.get("tissue_expression")
+                if expr:
+                    expression_batch.append((
+                        uniprot_id,
+                        expr.get("primary_tissue", ""),
+                        expr.get("full_description", "")
+                    ))
+                
+                n_uniprot += 1
+                
+                # バッチ挿入
+                if n_uniprot % 5000 == 0:
+                    if residue_feature_batch:
+                        cursor.executemany("""
+                            INSERT INTO uniprot_residue_features 
+                            (uniprot_id, position, feature_type, description)
+                            VALUES (?, ?, ?, ?)
+                        """, residue_feature_batch)
+                        residue_feature_batch = []
+                    if disulfide_batch:
+                        cursor.executemany("""
+                            INSERT INTO uniprot_disulfide_bonds 
+                            (uniprot_id, position1, position2, note)
+                            VALUES (?, ?, ?, ?)
+                        """, disulfide_batch)
+                        disulfide_batch = []
+                    if region_batch:
+                        cursor.executemany("""
+                            INSERT INTO uniprot_regions 
+                            (uniprot_id, region_type, start_pos, end_pos, description, side)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """, region_batch)
+                        region_batch = []
+                    if subloc_batch:
+                        cursor.executemany("""
+                            INSERT INTO uniprot_subcellular_locations 
+                            (uniprot_id, location_chain)
+                            VALUES (?, ?)
+                        """, subloc_batch)
+                        subloc_batch = []
+                    if expression_batch:
+                        cursor.executemany("""
+                            INSERT OR REPLACE INTO uniprot_expression 
+                            (uniprot_id, primary_tissue, full_description)
+                            VALUES (?, ?, ?)
+                        """, expression_batch)
+                        expression_batch = []
+                    conn.commit()
+                    logging.info(f"  Processed {n_uniprot} UniProt entries...")
+        
+        # 残りのバッチを挿入
+        if residue_feature_batch:
+            cursor.executemany("""
+                INSERT INTO uniprot_residue_features 
+                (uniprot_id, position, feature_type, description)
+                VALUES (?, ?, ?, ?)
+            """, residue_feature_batch)
+        if disulfide_batch:
+            cursor.executemany("""
+                INSERT INTO uniprot_disulfide_bonds 
+                (uniprot_id, position1, position2, note)
+                VALUES (?, ?, ?, ?)
+            """, disulfide_batch)
+        if region_batch:
+            cursor.executemany("""
+                INSERT INTO uniprot_regions 
+                (uniprot_id, region_type, start_pos, end_pos, description, side)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, region_batch)
+        if subloc_batch:
+            cursor.executemany("""
+                INSERT INTO uniprot_subcellular_locations 
+                (uniprot_id, location_chain)
+                VALUES (?, ?)
+            """, subloc_batch)
+        if expression_batch:
+            cursor.executemany("""
+                INSERT OR REPLACE INTO uniprot_expression 
+                (uniprot_id, primary_tissue, full_description)
+                VALUES (?, ?, ?)
+            """, expression_batch)
+        
+        conn.commit()
+        logging.info(f"  Loaded {n_uniprot} UniProt feature entries")
     
     # ファイナライズ
     conn.close()
