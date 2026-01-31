@@ -95,7 +95,13 @@ class HumanProteomeDB:
     
     # ========== タンパク質レベルのクエリ ==========
     
-    def get_protein(self, uniprot_id: str, include_partners: bool = True) -> Optional[Dict[str, Any]]:
+    def get_protein(
+        self, 
+        uniprot_id: str, 
+        include_partners: bool = True,
+        include_go: bool = False,
+        include_locations: bool = False
+    ) -> Optional[Dict[str, Any]]:
         """
         タンパク質情報を取得
         
@@ -105,6 +111,10 @@ class HumanProteomeDB:
             UniProt アクセッション番号
         include_partners : bool
             PPIパートナー情報を含めるか（デフォルトTrue）
+        include_go : bool
+            GO terms情報を含めるか（デフォルトFalse）
+        include_locations : bool
+            細胞内局在情報を含めるか（デフォルトFalse）
         
         Returns
         -------
@@ -130,6 +140,14 @@ class HumanProteomeDB:
         # PPIパートナーを追加
         if include_partners:
             protein["ppi_partners"] = self.get_ppi_partners(uniprot_id)
+        
+        # GO termsを追加
+        if include_go:
+            protein["go"] = self.get_protein_go(uniprot_id)
+        
+        # 細胞内局在を追加
+        if include_locations:
+            protein["locations"] = self.get_protein_locations(uniprot_id)
         
         return protein
     
