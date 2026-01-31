@@ -670,6 +670,17 @@ def main():
                         None
                     ))
                 
+                # Transit peptides (mitochondria, chloroplast targeting)
+                for feat in region_features.get("transit_peptides", []):
+                    region_batch.append((
+                        uniprot_id,
+                        "transit_peptide",
+                        feat.get("start"),
+                        feat.get("end"),
+                        feat.get("description", ""),
+                        None
+                    ))
+                
                 # Transmembrane
                 for feat in region_features.get("transmembrane", []):
                     region_batch.append((

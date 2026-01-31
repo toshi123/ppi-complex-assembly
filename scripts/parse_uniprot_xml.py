@@ -91,6 +91,7 @@ def parse_features(entry):
     
     # 領域レベル
     signal_peptides = []
+    transit_peptides = []
     transmembrane_regions = []
     topological_domains = []
     dna_binding_regions = []
@@ -146,6 +147,14 @@ def parse_features(entry):
                 signal_peptides.append({
                     "start": start,
                     "end": end
+                })
+        
+        elif ftype == "transit peptide":
+            if start and end:
+                transit_peptides.append({
+                    "start": start,
+                    "end": end,
+                    "description": desc  # e.g., "Mitochondrion"
                 })
         
         elif ftype == "transmembrane region":
@@ -214,6 +223,7 @@ def parse_features(entry):
         },
         "region_features": {
             "signal_peptides": signal_peptides,
+            "transit_peptides": transit_peptides,
             "transmembrane": transmembrane_regions,
             "topological_domains": topological_domains,
             "dna_binding": dna_binding_regions,
