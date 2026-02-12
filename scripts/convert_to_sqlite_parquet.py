@@ -18,10 +18,11 @@ JSONLおよびJSONファイルをSQLite + Parquet形式に変換する。
 使い方:
 python scripts/convert_to_sqlite_parquet.py \
     --annotations data/processed/residue_annotations.jsonl \
-    --ac2de /path/to/ac2json/ac2de.json \
-    --ac2go /path/to/ac2json/ac2go.json \
-    --ac2seq /path/to/ac2json/ac2seq.json \
-    --ac2loc /path/to/ac2json/ac2subcellularlocations_up_classified4.json \
+    --ac2de /Users/tsuji/Library/CloudStorage/Dropbox/Lecture/MSTC/proteins/ac2json/ac2de.json \
+    --ac2go /Users/tsuji/Library/CloudStorage/Dropbox/Lecture/MSTC/proteins/ac2json/ac2go.json \
+    --ac2seq /Users/tsuji/Library/CloudStorage/Dropbox/Lecture/MSTC/proteins/ac2json/ac2seq.json \
+    --ac2loc /Users/tsuji/Library/CloudStorage/Dropbox/Lecture/MSTC/proteins/ac2json/ac2subcellularlocations_up_classified4.json \
+    --ac-alias-json data/processed/uniprot_alias_to_primary.json \
     --out-sqlite data/processed/human_proteome.sqlite \
     --out-parquet data/processed/human_residues.parquet
 """
@@ -54,6 +55,8 @@ def parse_args():
                    help="ac2subcellularlocations_up_classified4.json")
     p.add_argument("--uniprot-features",
                    help="uniprot_features.jsonl (optional, from parse_uniprot_xml.py)")
+    p.add_argument("--ac-alias-json",
+                   help="Optional: JSON dict of alias_ac -> primary_ac (UniProt secondary/obsolete to primary)")
     p.add_argument("--out-sqlite", default="data/processed/human_proteome.sqlite",
                    help="Output SQLite database")
     p.add_argument("--out-parquet", default="data/processed/human_residues.parquet",
@@ -405,7 +408,23 @@ def main():
     ac2go = load_json(args.ac2go)
     ac2loc = load_json(args.ac2loc)
     ac2seq = load_json(args.ac2seq)
-    
+
+    # alias -> primary map (optional)
+    alias_map = {}
+    if args.ac_alias_json:
+        alias_map = load_json(args.ac_alias_json)
+        # keep only non-empty mappings
+        alias_map = {k: v for k, v in alias_map.items() if k and v}
+
+    def norm(ac: str) -> str:
+        """Normalize UniProt accession to primary, if mapping is provided."""
+        if not ac:
+            return ac
+        return alias_map.get(ac, ac)
+
+    logging.info(f"Alias map loaded: {len(alias_map):,} entries")
+    logging.info(f"Test normalize: A0A024QZ45 -> {norm('A0A024QZ45')}") 
+
     # SQLite接続
     logging.info(f"Creating SQLite database: {args.out_sqlite}")
     conn = sqlite3.connect(args.out_sqlite)
@@ -440,7 +459,8 @@ def main():
                 continue
             
             rec = json.loads(line)
-            uniprot_id = rec["uniprot_id"]
+            raw_ac = rec["uniprot_id"]
+            uniprot_id = norm(raw_ac)  # primary AC
             sequence = rec.get("sequence", "")
             length = rec.get("length", len(sequence))
             residues = rec.get("residues", {})
@@ -451,7 +471,7 @@ def main():
             processed_acs.add(uniprot_id)
             
             # タンパク質情報をSQLiteに挿入
-            description = ac2de.get(uniprot_id, "")
+            description = ac2de.get(uniprot_id) or ac2de.get(raw_ac, "")
             cursor.execute("""
                 INSERT OR REPLACE INTO proteins 
                 (uniprot_id, sequence, length, description, 
@@ -472,26 +492,27 @@ def main():
             ))
             
             # GO terms
-            if uniprot_id in ac2go:
-                go_data = ac2go[uniprot_id]
+            go_data = ac2go.get(uniprot_id) or ac2go.get(raw_ac)
+            if go_data:
                 for category in ["F", "C", "P"]:
                     for term in go_data.get(category, []):
                         go_batch.append((uniprot_id, category, term))
             
             # Locations
-            if uniprot_id in ac2loc:
-                for loc in ac2loc[uniprot_id]:
+            locs = ac2loc.get(uniprot_id) or ac2loc.get(raw_ac)
+            if locs:
+                for loc in locs:
                     loc_batch.append((uniprot_id, loc))
             
             # PPI partners
             for partner in summary.get("ppi_partners", []):
-                ppi_batch.append((uniprot_id, partner))
+                ppi_batch.append((uniprot_id, norm(partner)))
             
             # PPI interfaces（パートナーごとの詳細）
             for partner_id, iface_info in ppi_interfaces.items():
                 ppi_iface_batch.append((
                     uniprot_id,
-                    partner_id,
+                    norm(partner_id),
                     iface_info.get("pdb_id"),
                     json.dumps(iface_info.get("chains", [])),
                     json.dumps(iface_info.get("residues", [])),
@@ -507,7 +528,8 @@ def main():
             for pos_str, info in residues.items():
                 pos = int(pos_str)
                 partners = info.get("interface_partners", [])
-                partners_json = json.dumps(partners) if partners else "[]"
+                partners_norm = [norm(x) for x in partners] if partners else []
+                partners_json = json.dumps(partners_norm) if partners_norm else "[]"
                 
                 residue_rows.append({
                     "uniprot_id": uniprot_id,
@@ -586,42 +608,50 @@ def main():
     # （残基データはないが、メタデータとして保持）
     logging.info("Adding proteins from ac2seq that are not in annotations...")
     n_added = 0
-    for uniprot_id, seq in ac2seq.items():
-        if uniprot_id not in processed_acs:
-            description = ac2de.get(uniprot_id, "")
-            cursor.execute("""
-                INSERT OR IGNORE INTO proteins 
-                (uniprot_id, sequence, length, description,
-                 n_surface, n_buried, n_unknown, n_disorder, n_interface)
-                VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0)
-            """, (uniprot_id, seq, len(seq), description))
-            
-            # GO terms
-            if uniprot_id in ac2go:
-                go_data = ac2go[uniprot_id]
-                for category in ["F", "C", "P"]:
-                    for term in go_data.get(category, []):
-                        cursor.execute(
-                            "INSERT INTO protein_go (uniprot_id, category, go_term) VALUES (?, ?, ?)",
-                            (uniprot_id, category, term)
-                        )
-            
-            # Locations
-            if uniprot_id in ac2loc:
-                for loc in ac2loc[uniprot_id]:
+
+    for raw_ac, seq in ac2seq.items():
+        uniprot_id = norm(raw_ac)  # ★ここが最重要（primary化）
+
+        # ★ processed_acs は「primary」で管理されている前提
+        if uniprot_id in processed_acs:
+            continue
+
+        description = ac2de.get(uniprot_id) or ac2de.get(raw_ac, "")
+
+        cursor.execute("""
+            INSERT OR IGNORE INTO proteins
+            (uniprot_id, sequence, length, description,
+            n_surface, n_buried, n_unknown, n_disorder, n_interface, surface_pdb_sources)
+            VALUES (?, ?, ?, ?, 0, 0, 0, 0, 0, "[]")
+        """, (uniprot_id, seq, len(seq), description))
+
+        go_data = ac2go.get(uniprot_id) or ac2go.get(raw_ac)
+        if go_data:
+            for category in ["F", "C", "P"]:
+                for term in go_data.get(category, []):
                     cursor.execute(
-                        "INSERT INTO protein_locations (uniprot_id, location) VALUES (?, ?)",
-                        (uniprot_id, loc)
+                        "INSERT INTO protein_go (uniprot_id, category, go_term) VALUES (?, ?, ?)",
+                        (uniprot_id, category, term)
                     )
-            
-            n_added += 1
-            if n_added % 10000 == 0:
-                conn.commit()
-                logging.info(f"  Added {n_added} additional proteins...")
-    
+
+        locs = ac2loc.get(uniprot_id) or ac2loc.get(raw_ac)
+        if locs:
+            for loc in locs:
+                cursor.execute(
+                    "INSERT INTO protein_locations (uniprot_id, location) VALUES (?, ?)",
+                    (uniprot_id, loc)
+                )
+
+        processed_acs.add(uniprot_id)  # ★ここもprimaryで
+        n_added += 1
+
+        if n_added % 10000 == 0:
+            conn.commit()
+            logging.info(f"  Added {n_added} additional proteins...")
+
     conn.commit()
     logging.info(f"  Added {n_added} proteins from ac2seq")
-    
+
     # UniProt features の読み込みと挿入
     if args.uniprot_features:
         logging.info(f"Loading UniProt features: {args.uniprot_features}")
@@ -642,7 +672,8 @@ def main():
                     continue
                 
                 rec = json.loads(line)
-                uniprot_id = rec["uniprot_id"]
+                raw_ac = rec["uniprot_id"]
+                uniprot_id = norm(raw_ac)
                 
                 # 残基レベル特徴
                 residue_features = rec.get("residue_features", {})

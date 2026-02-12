@@ -15,14 +15,7 @@ venv/
 # Data
 data/raw/
 data/interim/
-data/processed/*.sqlite
-data/processed/*.parquet
-data/processed/*.h5
-data/processed/*.pkl
-data/processed/interfaces/*.json
-data/processed/interfaces/*.jsonl
-data/processed/*.json
-data/processed/*.jsonl
+data/processed/
 
 
 # Results (重いもの)
@@ -34,6 +27,7 @@ results/**/*.pkl
 .DS_Store
 *.swp
 *.swo
+*.backup
 .vscode/
 .idea/
 .specstory/
