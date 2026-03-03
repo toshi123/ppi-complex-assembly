@@ -305,6 +305,18 @@ def create_sqlite_schema(conn: sqlite3.Connection):
         ON uniprot_refseq(nucleotide_id)
     """)
     
+    # AC エイリアス（secondary/obsolete → primary 変換用）
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ac_aliases (
+            alias_ac TEXT PRIMARY KEY,
+            primary_ac TEXT NOT NULL
+        )
+    """)
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_ac_aliases_primary 
+        ON ac_aliases(primary_ac)
+    """)
+    
     conn.commit()
 
 
@@ -430,6 +442,16 @@ def main():
     conn = sqlite3.connect(args.out_sqlite)
     create_sqlite_schema(conn)
     cursor = conn.cursor()
+
+    # ac_aliases テーブルにエイリアスを一括挿入
+    if alias_map:
+        logging.info(f"Inserting {len(alias_map):,} AC aliases into SQLite...")
+        cursor.executemany(
+            "INSERT OR REPLACE INTO ac_aliases (alias_ac, primary_ac) VALUES (?, ?)",
+            alias_map.items()
+        )
+        conn.commit()
+        logging.info("  AC aliases inserted")
     
     # Parquetライター
     logging.info(f"Creating Parquet file: {args.out_parquet}")

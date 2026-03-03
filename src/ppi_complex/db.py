@@ -93,6 +93,15 @@ class HumanProteomeDB:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
     
+    # ========== AC 正規化 ==========
+    
+    def _normalize_ac(self, uniprot_id: str) -> str:
+        """Secondary/obsolete AC を primary AC に変換する。該当がなければそのまま返す。"""
+        row = self.conn.execute("""
+            SELECT primary_ac FROM meta.ac_aliases WHERE alias_ac = ?
+        """, [uniprot_id]).fetchone()
+        return row[0] if row else uniprot_id
+    
     # ========== タンパク質レベルのクエリ ==========
     
     def get_protein(
@@ -121,6 +130,8 @@ class HumanProteomeDB:
         dict or None
             タンパク質情報の辞書、見つからない場合はNone
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         result = self.conn.execute("""
             SELECT * FROM meta.proteins WHERE uniprot_id = ?
         """, [uniprot_id]).fetchone()
@@ -167,6 +178,8 @@ class HumanProteomeDB:
         list of dict
             [{"category": "F", "go_term": "GO:0005515"}, ...]
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         if category:
             result = self.conn.execute("""
                 SELECT category, go_term FROM meta.protein_go 
@@ -194,6 +207,8 @@ class HumanProteomeDB:
         list of str
             局在のリスト
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         result = self.conn.execute("""
             SELECT location FROM meta.protein_locations 
             WHERE uniprot_id = ?
@@ -215,6 +230,8 @@ class HumanProteomeDB:
         list of str
             パートナーのUniProt IDリスト
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         result = self.conn.execute("""
             SELECT DISTINCT partner_id FROM meta.ppi_partners 
             WHERE uniprot_id = ?
@@ -240,6 +257,8 @@ class HumanProteomeDB:
         dict or None
             残基情報の辞書
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         result = self.conn.execute("""
             SELECT * FROM residues 
             WHERE uniprot_id = ? AND position = ?
@@ -280,6 +299,8 @@ class HumanProteomeDB:
         list of dict
             残基情報のリスト
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         query = "SELECT * FROM residues WHERE uniprot_id = ?"
         params = [uniprot_id]
         
@@ -318,6 +339,8 @@ class HumanProteomeDB:
         list of dict
             表面残基のリスト
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         result = self.conn.execute("""
             SELECT * FROM residues 
             WHERE uniprot_id = ? AND surface = 'surface'
@@ -355,6 +378,10 @@ class HumanProteomeDB:
         list of dict
             界面残基のリスト
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        if partner_id is not None:
+            partner_id = self._normalize_ac(partner_id)
+        
         result = self.conn.execute("""
             SELECT * FROM residues 
             WHERE uniprot_id = ? AND interface_partners != '[]'
@@ -404,6 +431,8 @@ class HumanProteomeDB:
                 ...
             }
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         # Parquetから残基レベルの情報を取得
         result = self.conn.execute("""
             SELECT position, interface_partners FROM residues 
@@ -482,6 +511,8 @@ class HumanProteomeDB:
         list of dict
             ディスオーダー残基のリスト
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         result = self.conn.execute("""
             SELECT * FROM residues 
             WHERE uniprot_id = ? AND disorder = true
@@ -521,6 +552,8 @@ class HumanProteomeDB:
         list of dict
             [{"position": 123, "feature_type": "active_site", "description": "..."}, ...]
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         if feature_type:
             rows = self.conn.execute("""
                 SELECT position, feature_type, description
@@ -555,6 +588,8 @@ class HumanProteomeDB:
         list of dict
             [{"position1": 47, "position2": 60, "note": ""}, ...]
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         rows = self.conn.execute("""
             SELECT position1, position2, note
             FROM meta.uniprot_disulfide_bonds
@@ -590,6 +625,8 @@ class HumanProteomeDB:
             [{"region_type": "transmembrane", "start": 99, "end": 124, 
               "description": "Helical", "side": None}, ...]
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         if region_type:
             rows = self.conn.execute("""
                 SELECT region_type, start_pos, end_pos, description, side
@@ -631,6 +668,8 @@ class HumanProteomeDB:
             {"primary_tissue": "gastrocnemius", 
              "full_description": "Expressed in gastrocnemius and 214 other cell types or tissues"}
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         row = self.conn.execute("""
             SELECT primary_tissue, full_description
             FROM meta.uniprot_expression
@@ -655,6 +694,8 @@ class HumanProteomeDB:
         list of str
             ["Cytoplasm > Cell cortex", "Nucleus", ...]
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         rows = self.conn.execute("""
             SELECT location_chain
             FROM meta.uniprot_subcellular_locations
@@ -743,6 +784,8 @@ class HumanProteomeDB:
         list of dict
             [{"gene_name": "FOXRED1", "name_type": "primary"}, ...]
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         rows = self.conn.execute("""
             SELECT gene_name, name_type
             FROM meta.uniprot_gene_names
@@ -790,6 +833,8 @@ class HumanProteomeDB:
         list of dict
             [{"protein_id": "NP_*", "nucleotide_id": "NM_*"}, ...]
         """
+        uniprot_id = self._normalize_ac(uniprot_id)
+        
         rows = self.conn.execute("""
             SELECT protein_id, nucleotide_id
             FROM meta.uniprot_refseq
